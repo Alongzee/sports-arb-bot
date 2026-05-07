@@ -128,18 +128,14 @@ async def main():
     log.info(f"  Database: {DB_PATH}")
     log.info("=" * 55)
 
-    # ── Hardcoded match list for now — later replace with live match discovery ──
-    # Format: {match_name: {"platform": "url", ...}}
-    # You'll build this manually during observation or pull from a match feed
     matches_to_scan = [
-        # Example entry — replace with real matches during your session
-        # {
-        #     "name": "Crystal Palace vs Shakhtar",
-        #     "urls": {
-        #         "sportybet": "https://sportybet.com/gh/m/spc/...",
-        #         "1win": "https://1win.com/...",
-        #     }
-        # },
+        {
+            "name": "Crystal Palace vs Shakhtar",
+            "urls": {
+                "sportybet": "https://www.sportybet.com/gh/m/sport/football/International_Clubs/UEFA_Conference_League/Crystal_Palace_vs_Shakhtar_D/sr:match:69340062",
+                "1win": "https://1wgcmt.com/betting/match/sport/crystal-palace-vs-fc-shakhtar-donetsk-34525789?p=32p4",
+            },
+        },
     ]
 
     log.info(f"Monitoring {len(matches_to_scan)} matches.")
