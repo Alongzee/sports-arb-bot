@@ -5,7 +5,7 @@ All constants, thresholds, and runtime settings.
 
 import os
 import random
-from typing import List, Tuple
+from typing import List
 
 # ── Telegram ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
@@ -36,7 +36,6 @@ def generate_cool_off_days() -> List[int]:
     """
     days = list(range(7))
     random.shuffle(days)
-    # Pick first day, then remove it and its neighbours to avoid consecutive days
     first = days[0]
     excluded = {first, (first + 1) % 7, (first - 1) % 7}
     remaining = [d for d in days if d not in excluded]
@@ -77,6 +76,9 @@ STABILITY_LOW    = 0.2   # live, late game
 # ── Database ──────────────────────────────────────────────────────────────
 DB_PATH = os.path.expanduser("~/sports-arb-bot/arb_opportunities.db")
 
-# ── Passive Mode (overnight scanning) ─────────────────────────────────────
+# ── Passive Mode (overnight scanning) ────────────────────────────────────
 PASSIVE_MODE_START = 18   # 6 PM UTC
 PASSIVE_MODE_END   = 6    # 6 AM UTC
+
+# ── Scan Interval ─────────────────────────────────────────────────────────
+SCAN_INTERVAL = 2  # seconds between full scan cycles
