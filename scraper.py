@@ -4,6 +4,7 @@ All five platforms implemented. Returns standardised odds dictionaries.
 """
 
 import asyncio
+import re
 from playwright.async_api import async_playwright
 
 
@@ -29,22 +30,9 @@ class BaseScraper:
         return None
 
 
+# ─── SportyBet (API‑based) ─────────────────────────────────────────────
+
 class SportyBetScraper:
-    """
-    Uses SportyBet's internal REST API — no browser/Playwright needed.
-    Endpoint: /api/gh/factsCenter/event?eventId=<id>&productId=3
-
-    Match ID extraction: URL contains sr:match:XXXXXXXX
-    e.g. https://www.sportybet.com/gh/sport/football/.../sr:match:69340062
-                                                              ^^^^^^^^^^^^
-    API response structure:
-      data.markets[].name        = "Over/Under" | "Asian Handicap"
-      data.markets[].specifier   = "total=2.5" | "hcp=0:1"
-      data.markets[].outcomes[].desc  = "Over" | "Under" | "Home" | "Away"
-      data.markets[].outcomes[].odds  = "1.72"
-      data.markets[].outcomes[].isActive = 1
-    """
-
     API_BASE = "https://www.sportybet.com/api/gh/factsCenter/event"
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
@@ -54,8 +42,6 @@ class SportyBetScraper:
     }
 
     def _extract_event_id(self, match_url: str) -> str | None:
-        """Extracts sr:match:XXXXXXXX from the URL."""
-        import re
         m = re.search(r'(sr:match:\d+)', match_url)
         return m.group(1) if m else None
 
@@ -86,7 +72,7 @@ class SportyBetScraper:
                 return odds_data
 
             for market in data["data"].get("markets", []):
-                if not market.get("status") == 0:  # 0 = active
+                if not market.get("status") == 0:
                     continue
 
                 name      = market.get("name", "")
@@ -94,36 +80,32 @@ class SportyBetScraper:
                 outcomes  = market.get("outcomes", [])
 
                 if name == "Over/Under":
-                    entry = {}
                     for o in outcomes:
                         if o.get("isActive") != 1:
                             continue
-                        desc = o.get("desc", "")  # e.g. "Over 2.5" or "Under 2.5"
+                        desc = o.get("desc", "")
                         val  = self._parse_odds(o.get("odds"))
                         if not val:
                             continue
                         parts = desc.split()
                         if len(parts) == 2:
-                            direction = parts[0].lower()  # "over" or "under"
-                            line      = parts[1]           # "2.5"
+                            direction = parts[0].lower()
+                            line      = parts[1]
                             key = f"over_under_{line}"
                             if key not in odds_data:
                                 odds_data[key] = {}
                             odds_data[key][direction] = val
 
                 elif name == "Asian Handicap":
-                    entry = {}
                     for o in outcomes:
                         if o.get("isActive") != 1:
                             continue
-                        desc = o.get("desc", "")  # e.g. "Home" or "Away"
+                        desc = o.get("desc", "")
                         val  = self._parse_odds(o.get("odds"))
                         if not val:
                             continue
-                        # specifier = "hcp=0:1" means home:-0, away:+1
-                        # Use specifier to determine line
                         line = specifier.replace("hcp=", "").replace(":", "/")
-                        side = desc.lower()  # "home" or "away"
+                        side = desc.lower()
                         key  = f"asian_handicap_{line}"
                         if key not in odds_data:
                             odds_data[key] = {}
@@ -136,95 +118,56 @@ class SportyBetScraper:
         return odds_data
 
 
+# ─── 1win (text‑parsing, no fragile CSS) ───────────────────────────────
+
 class OneWinScraper(BaseScraper):
-    """
-    Real HTML structure (verified from live page with en-US locale):
-      ._title_8ulje_6   — market group title e.g. "Total", "Handicap"
-      ._name_1hbh7_36   — outcome name e.g. "Over 2.5", "Under 2.5"
-      ._cf_17if8_2      — odds value e.g. "1.77" (plain float, no prefix)
-
-    CSS module hashes are stable per deploy but may change on updates.
-    If scraper breaks, re-run inspect_pages.py and grep for the new hashes.
-
-    Must use en-US locale — default locale resolves to Japanese on Tokyo VPS.
-    """
-    BASE_URL = "https://1wgcmt.com"
-
-    async def _get_page(self, url: str):
-        """Override to force en-US locale."""
-        pw = await async_playwright().start()
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            locale="en-US",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
-        )
-        page = await context.new_page()
-        await page.goto(url, wait_until="networkidle")
-        return pw, browser, page
+    BASE_URL = "https://1wgcmt.com/betting/match/sport"
 
     async def get_odds(self, match_url: str) -> dict:
         odds_data = {}
         pw, browser, page = await self._get_page(match_url)
+
         try:
-            await page.wait_for_selector("._title_8ulje_6", timeout=15000)
+            # Wait for the word "Over" – a reliable signal that odds are loaded
+            await page.wait_for_selector("text=Over", timeout=15000)
+            # Extra delay for any late JavaScript
+            await page.wait_for_timeout(2000)
 
-            # Get all market group sections
-            sections = await page.query_selector_all("._root_m2ytg_2")
+            # Grab all visible text
+            text = await page.evaluate("document.body.innerText")
 
-            for section in sections:
-                title_el = await section.query_selector("._title_8ulje_6")
-                if not title_el:
-                    continue
-                title = (await title_el.inner_text()).strip().lower()
+            # ── Over/Under lines ──────────────────────────────────────────
+            # Pattern: "Over 2.5 1.72  Under 2.5 1.95" (many variations)
+            over_under_regex = re.compile(
+                r"Over\s+(\d+\.?\d*)\s+(\d+\.\d{2})\s+Under\s+\1\s+(\d+\.\d{2})"
+            )
+            for match in over_under_regex.finditer(text):
+                line = match.group(1)
+                over = float(match.group(2))
+                under = float(match.group(3))
+                odds_data[f"over_under_{line}"] = {"over": over, "under": under}
 
-                # Only process Total (Over/Under) and Handicap markets
-                if "total" not in title and "handicap" not in title:
-                    continue
-
-                # Get all outcome buttons in this section
-                buttons = await section.query_selector_all("._root_1hbh7_2")
-                for btn in buttons:
-                    name_el = await btn.query_selector("._name_1hbh7_36")
-                    odds_el = await btn.query_selector("._cf_17if8_2")
-                    if not (name_el and odds_el):
-                        continue
-
-                    name     = (await name_el.inner_text()).strip()
-                    odds_val = self._parse_odds(await odds_el.inner_text())
-                    if not odds_val:
-                        continue
-
-                    if "total" in title:
-                        # name = "Over 2.5" or "Under 2.5"
-                        parts = name.split()
-                        if len(parts) == 2 and parts[0].lower() in ("over", "under"):
-                            direction = parts[0].lower()
-                            line      = parts[1]
-                            key = f"over_under_{line}"
-                            if key not in odds_data:
-                                odds_data[key] = {}
-                            odds_data[key][direction] = odds_val
-
-                    elif "handicap" in title:
-                        # name = "Crystal Palace -1.5" or "FC Shakhtar +1.5"
-                        # Last token is the handicap line, second-to-last may be sign
-                        parts = name.rsplit(None, 1)
-                        if len(parts) == 2:
-                            line = parts[1]  # e.g. "-1.5"
-                            # Determine home/away by position (first btn = home)
-                            key = f"asian_handicap_{line}"
-                            if key not in odds_data:
-                                odds_data[key] = {"home": odds_val}
-                            elif "away" not in odds_data[key]:
-                                odds_data[key]["away"] = odds_val
+            # ── Asian Handicap lines ──────────────────────────────────────
+            # Pattern: "Handicap -2.5 4.80 1.19" or "Asian Handicap -2.5 4.80 1.19"
+            asian_hcp_regex = re.compile(
+                r"(?:Asian\s+)?Handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})"
+            )
+            for match in asian_hcp_regex.finditer(text):
+                line = match.group(1)
+                home = float(match.group(2))
+                away = float(match.group(3))
+                odds_data[f"asian_handicap_{line}"] = {"home": home, "away": away}
 
         except Exception as e:
             print(f"1win error: {e}")
         finally:
             await browser.close()
             await pw.stop()
+
         return odds_data
 
+
+# ─── Betway ─────────────────────────────────────────────────────────────
 
 class BetwayScraper(BaseScraper):
     BASE_URL = "https://betway.com.gh"
@@ -235,7 +178,6 @@ class BetwayScraper(BaseScraper):
         try:
             await page.wait_for_selector(".market", timeout=15000)
 
-            # Over/Under
             ou_sections = await page.query_selector_all(".market:has(.marketTitle:-soup-contains('Total Goals'))")
             for sec in ou_sections:
                 selections = await sec.query_selector_all(".selection")
@@ -253,7 +195,6 @@ class BetwayScraper(BaseScraper):
                                 odds_data[key] = {}
                             odds_data[key][direction] = odds
 
-            # Asian Handicap
             ah_sections = await page.query_selector_all(".market:has(.marketTitle:-soup-contains('Asian Handicap'))")
             for sec in ah_sections:
                 selections = await sec.query_selector_all(".selection")
@@ -278,6 +219,8 @@ class BetwayScraper(BaseScraper):
         return odds_data
 
 
+# ─── BetWinner ───────────────────────────────────────────────────────────
+
 class BetWinnerScraper(BaseScraper):
     BASE_URL = "https://betwinner.com.gh"
 
@@ -287,7 +230,6 @@ class BetWinnerScraper(BaseScraper):
         try:
             await page.wait_for_selector(".market-block", timeout=15000)
 
-            # Over/Under
             ou_blocks = await page.query_selector_all(".market-block:has(.market-name:-soup-contains('Total'))")
             for block in ou_blocks:
                 rows = await block.query_selector_all(".market-row")
@@ -300,7 +242,6 @@ class BetWinnerScraper(BaseScraper):
                         if over and under:
                             odds_data[f"over_under_{line}"] = {"over": over, "under": under}
 
-            # Asian Handicap
             ah_blocks = await page.query_selector_all(".market-block:has(.market-name:-soup-contains('Handicap'))")
             for block in ah_blocks:
                 rows = await block.query_selector_all(".market-row")
@@ -321,6 +262,8 @@ class BetWinnerScraper(BaseScraper):
         return odds_data
 
 
+# ─── BetPawa ─────────────────────────────────────────────────────────────
+
 class BetPawaScraper(BaseScraper):
     BASE_URL = "https://betpawa.com.gh"
 
@@ -330,7 +273,6 @@ class BetPawaScraper(BaseScraper):
         try:
             await page.wait_for_selector(".market-section", timeout=15000)
 
-            # Over/Under
             ou_sections = await page.query_selector_all(".market-section:has(.section-title:-soup-contains('Over/Under'))")
             for sec in ou_sections:
                 rows = await sec.query_selector_all(".odds-row")
@@ -343,7 +285,6 @@ class BetPawaScraper(BaseScraper):
                         if over and under:
                             odds_data[f"over_under_{line}"] = {"over": over, "under": under}
 
-            # Asian Handicap
             ah_sections = await page.query_selector_all(".market-section:has(.section-title:-soup-contains('Asian Handicap'))")
             for sec in ah_sections:
                 rows = await sec.query_selector_all(".odds-row")
