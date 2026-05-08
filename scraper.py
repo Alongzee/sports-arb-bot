@@ -7,6 +7,7 @@ import asyncio
 import re
 import httpx
 from playwright.async_api import async_playwright
+from matcher import normalise_market
 
 
 class BaseScraper:
@@ -31,7 +32,7 @@ class BaseScraper:
         return None
 
 
-# ─── SportyBet (API‑based) ─────────────────────────────────────────────
+# ─── SportyBet (API‑based, handles all official market types) ────────────
 
 class SportyBetScraper:
     API_BASE = "https://www.sportybet.com/api/gh/factsCenter/event"
@@ -54,7 +55,6 @@ class SportyBetScraper:
 
     async def get_odds(self, match_url: str) -> dict:
         odds_data = {}
-
         event_id = self._extract_event_id(match_url)
         if not event_id:
             print(f"SportyBet error: cannot extract event ID from {match_url}")
@@ -74,11 +74,11 @@ class SportyBetScraper:
             for market in data["data"].get("markets", []):
                 if not market.get("status") == 0:
                     continue
-
                 name      = market.get("name", "")
                 specifier = market.get("specifier", "")
                 outcomes  = market.get("outcomes", [])
 
+                # ── Over/Under ──────────────────────────────────────
                 if name == "Over/Under":
                     for o in outcomes:
                         if o.get("isActive") != 1:
@@ -91,11 +91,12 @@ class SportyBetScraper:
                         if len(parts) == 2:
                             direction = parts[0].lower()
                             line      = parts[1]
-                            key = f"over_under_{line}"
+                            key = normalise_market(f"over_under_{line}")
                             if key not in odds_data:
                                 odds_data[key] = {}
                             odds_data[key][direction] = val
 
+                # ── Asian Handicap ──────────────────────────────────
                 elif name == "Asian Handicap":
                     for o in outcomes:
                         if o.get("isActive") != 1:
@@ -106,11 +107,89 @@ class SportyBetScraper:
                             continue
                         line = specifier.replace("hcp=", "").replace(":", "/")
                         side = desc.lower()
-                        key  = f"asian_handicap_{line}"
+                        key  = normalise_market(f"asian_handicap_{line}")
                         if key not in odds_data:
                             odds_data[key] = {}
                         if side in ("home", "away"):
                             odds_data[key][side] = val
+
+                # ── Double Chance ───────────────────────────────────
+                elif name == "Double Chance":
+                    for o in outcomes:
+                        if o.get("isActive") != 1:
+                            continue
+                        desc = o.get("desc", "")
+                        val  = self._parse_odds(o.get("odds"))
+                        if not val:
+                            continue
+                        key = normalise_market(f"double_chance_{desc.replace(' ', '_')}")
+                        if key not in odds_data:
+                            odds_data[key] = {}
+                        odds_data[key][desc.lower().replace(" ", "_")] = val
+
+                # ── Both Teams to Score ─────────────────────────────
+                elif name == "Both Teams to Score":
+                    for o in outcomes:
+                        if o.get("isActive") != 1:
+                            continue
+                        desc = o.get("desc", "")
+                        val  = self._parse_odds(o.get("odds"))
+                        if not val:
+                            continue
+                        key = normalise_market("both_to_score")
+                        if key not in odds_data:
+                            odds_data[key] = {}
+                        odds_data[key][desc.lower()] = val
+
+                # ── Draw No Bet ─────────────────────────────────────
+                elif name == "Draw No Bet":
+                    for o in outcomes:
+                        if o.get("isActive") != 1:
+                            continue
+                        desc = o.get("desc", "")
+                        val  = self._parse_odds(o.get("odds"))
+                        if not val:
+                            continue
+                        key = normalise_market("draw_no_bet")
+                        if key not in odds_data:
+                            odds_data[key] = {}
+                        odds_data[key][desc.lower()] = val
+
+                # ── 5/10/15‑min Over/Under ──────────────────────────
+                elif "Total Goals from 1 to" in name:
+                    for o in outcomes:
+                        if o.get("isActive") != 1:
+                            continue
+                        desc = o.get("desc", "")
+                        val  = self._parse_odds(o.get("odds"))
+                        if not val:
+                            continue
+                        parts = desc.split()
+                        if len(parts) == 2:
+                            direction = parts[0].lower()
+                            line      = parts[1]
+                            key = normalise_market(f"over_under_10min_{line}")
+                            if key not in odds_data:
+                                odds_data[key] = {}
+                            odds_data[key][direction] = val
+
+                # ── Corners Over/Under ──────────────────────────────
+                elif "Corners" in name and "Over/Under" in name:
+                    for o in outcomes:
+                        if o.get("isActive") != 1:
+                            continue
+                        desc = o.get("desc", "")
+                        val  = self._parse_odds(o.get("odds"))
+                        if not val:
+                            continue
+                        parts = desc.split()
+                        if len(parts) == 2:
+                            direction = parts[0].lower()
+                            line      = parts[1]
+                            key = normalise_market(f"corners_over_under_{line}")
+                            if key not in odds_data:
+                                odds_data[key] = {}
+                            odds_data[key][direction] = val
 
         except Exception as e:
             print(f"SportyBet error: {e}")
@@ -118,117 +197,53 @@ class SportyBetScraper:
         return odds_data
 
 
-# ─── 1win (Navigation‑proof, full‑text parsing) ─────────────────────────
+# ─── 1win (text‑parsing, uses normalise_market) ──────────────────────────
 
 class OneWinScraper(BaseScraper):
-    """
-    Scrapes 1win by waiting for odds to appear, then parsing
-    the visible page text – even if the page navigates away.
-    """
-
     BASE_URL = "https://1wgcmt.com"
-
-    async def _get_page_en_us(self, url: str):
-        pw = await async_playwright().start()
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            locale="en-US",
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
-        )
-        page = await context.new_page()
-        # Wait for the DOM to be ready – but don't wait for network idle (can timeout)
-        await page.goto(url, wait_until="domcontentloaded")
-        return pw, browser, page
 
     async def get_odds(self, match_url: str) -> dict:
         odds_data = {}
-        pw = browser = page = None
+        pw, browser, page = await self._get_page(match_url)
 
         try:
-            pw, browser, page = await self._get_page_en_us(match_url)
+            await page.wait_for_selector("text=Over", timeout=15000)
+            await page.wait_for_timeout(2000)
 
-            # Wait for the page to render (Vue.js SPA needs time)
-            # Single 8‑second wait is enough – no polling loops that break
-            await page.wait_for_timeout(8000)
+            text = await page.evaluate("document.body.innerText")
 
-            # Try to get the full visible text; if the page navigated,
-            # we catch the error and use a fallback.
-            full_text = ""
-            try:
-                full_text = await page.evaluate("document.body.innerText")
-            except Exception as e:
-                print(f"1win: initial evaluate failed ({e}), trying page.content()...")
-                try:
-                    content = await page.content()
-                    # Extract text from HTML content using regex
-                    # Remove tags and keep only visible text
-                    full_text = re.sub(r'<[^>]+>', ' ', content)
-                    full_text = re.sub(r'\s+', ' ', full_text)
-                except Exception as e2:
-                    print(f"1win: page.content() also failed ({e2})")
-                    return odds_data
+            # ── Over/Under ──────────────────────────────────────────
+            over_under_regex = re.compile(
+                r"Over\s+(\d+\.?\d*)\s+(\d+\.\d{2})\s+Under\s+\1\s+(\d+\.\d{2})"
+            )
+            for match in over_under_regex.finditer(text):
+                line = match.group(1)
+                over = float(match.group(2))
+                under = float(match.group(3))
+                key = normalise_market(f"over_under_{line}")
+                odds_data[key] = {"over": over, "under": under}
 
-            # If we have text, parse it
-            if full_text:
-                # ── Over/Under lines ──────────────────────────────────────
-                ou_regex = re.compile(
-                    r'(?:^|\n|\s{2,})'
-                    r'(Over|Under)\s+(\d+\.?\d*)\s+(\d+\.\d{2})',
-                    re.IGNORECASE
-                )
-                for match in ou_regex.finditer(full_text):
-                    direction = match.group(1).lower()
-                    line      = match.group(2)
-                    odds_val  = float(match.group(3))
-                    key = f"over_under_{line}"
-                    if key not in odds_data:
-                        odds_data[key] = {}
-                    odds_data[key][direction] = odds_val
-
-                # ── Asian Handicap lines ──────────────────────────────────
-                hcp_regex = re.compile(
-                    r'(?:Asian\s+)?Handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})',
-                    re.IGNORECASE
-                )
-                for match in hcp_regex.finditer(full_text):
-                    line = match.group(1)
-                    home = float(match.group(2))
-                    away = float(match.group(3))
-                    odds_data[f"asian_handicap_{line}"] = {"home": home, "away": away}
-
-                # ── Total goals format (if different) ─────────────────────
-                total_regex = re.compile(
-                    r'Total\s+(\d+\.?\d*)\s+Over\s+(\d+\.\d{2})\s+Under\s+(\d+\.\d{2})',
-                    re.IGNORECASE
-                )
-                for match in total_regex.finditer(full_text):
-                    line = match.group(1)
-                    over = float(match.group(2))
-                    under = float(match.group(3))
-                    odds_data[f"over_under_{line}"] = {"over": over, "under": under}
-
-                if not odds_data:
-                    all_nums = re.findall(r'\b\d+\.\d{2}\b', full_text)
-                    print(f"1win: Could not parse odds. Potential odds values: {len(all_nums)}")
-                    if all_nums:
-                        print(f"First 10: {all_nums[:10]}")
-                        print(f"Page text (first 400 chars):")
-                        print(full_text[:400])
-            else:
-                print("1win: no text extracted from page")
+            # ── Asian Handicap ──────────────────────────────────────
+            asian_hcp_regex = re.compile(
+                r"(?:Asian\s+)?Handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})"
+            )
+            for match in asian_hcp_regex.finditer(text):
+                line = match.group(1)
+                home = float(match.group(2))
+                away = float(match.group(3))
+                key = normalise_market(f"asian_handicap_{line}")
+                odds_data[key] = {"home": home, "away": away}
 
         except Exception as e:
-            print(f'1win error: {e}')
+            print(f"1win error: {e}")
         finally:
-            if browser:
-                await browser.close()
-            if pw:
-                await pw.stop()
+            await browser.close()
+            await pw.stop()
 
         return odds_data
 
 
-# ─── Betway ─────────────────────────────────────────────────────────────
+# ─── Betway ───────────────────────────────────────────────────────────────
 
 class BetwayScraper(BaseScraper):
     BASE_URL = "https://betway.com.gh"
@@ -251,7 +266,7 @@ class BetwayScraper(BaseScraper):
                         if odds:
                             direction = "over" if "Over" in line else "under"
                             line_num = line.split()[-1]
-                            key = f"over_under_{line_num}"
+                            key = normalise_market(f"over_under_{line_num}")
                             if key not in odds_data:
                                 odds_data[key] = {}
                             odds_data[key][direction] = odds
@@ -267,7 +282,7 @@ class BetwayScraper(BaseScraper):
                         odds = self._parse_odds(await odds_el.inner_text())
                         if odds:
                             direction = "home" if "Home" in line else "away"
-                            key = f"asian_handicap_{line.split()[-1]}"
+                            key = normalise_market(f"asian_handicap_{line.split()[-1]}")
                             if key not in odds_data:
                                 odds_data[key] = {}
                             odds_data[key][direction] = odds
@@ -280,7 +295,7 @@ class BetwayScraper(BaseScraper):
         return odds_data
 
 
-# ─── BetWinner ─────────────────────────────────────────────────────────
+# ─── BetWinner ────────────────────────────────────────────────────────────
 
 class BetWinnerScraper(BaseScraper):
     BASE_URL = "https://betwinner.com.gh"
@@ -301,7 +316,8 @@ class BetWinnerScraper(BaseScraper):
                         over = self._parse_odds(await cells[1].inner_text())
                         under = self._parse_odds(await cells[2].inner_text())
                         if over and under:
-                            odds_data[f"over_under_{line}"] = {"over": over, "under": under}
+                            key = normalise_market(f"over_under_{line}")
+                            odds_data[key] = {"over": over, "under": under}
 
             ah_blocks = await page.query_selector_all(".market-block:has(.market-name:-soup-contains('Handicap'))")
             for block in ah_blocks:
@@ -313,7 +329,8 @@ class BetWinnerScraper(BaseScraper):
                         home = self._parse_odds(await cells[1].inner_text())
                         away = self._parse_odds(await cells[2].inner_text())
                         if home and away:
-                            odds_data[f"asian_handicap_{line}"] = {"home": home, "away": away}
+                            key = normalise_market(f"asian_handicap_{line}")
+                            odds_data[key] = {"home": home, "away": away}
 
         except Exception as e:
             print(f"BetWinner error: {e}")
@@ -323,7 +340,7 @@ class BetWinnerScraper(BaseScraper):
         return odds_data
 
 
-# ─── BetPawa ───────────────────────────────────────────────────────────
+# ─── BetPawa ──────────────────────────────────────────────────────────────
 
 class BetPawaScraper(BaseScraper):
     BASE_URL = "https://betpawa.com.gh"
@@ -344,7 +361,8 @@ class BetPawaScraper(BaseScraper):
                         over = self._parse_odds(await cells[1].inner_text())
                         under = self._parse_odds(await cells[2].inner_text())
                         if over and under:
-                            odds_data[f"over_under_{line}"] = {"over": over, "under": under}
+                            key = normalise_market(f"over_under_{line}")
+                            odds_data[key] = {"over": over, "under": under}
 
             ah_sections = await page.query_selector_all(".market-section:has(.section-title:-soup-contains('Asian Handicap'))")
             for sec in ah_sections:
@@ -356,7 +374,8 @@ class BetPawaScraper(BaseScraper):
                         home = self._parse_odds(await cells[1].inner_text())
                         away = self._parse_odds(await cells[2].inner_text())
                         if home and away:
-                            odds_data[f"asian_handicap_{line}"] = {"home": home, "away": away}
+                            key = normalise_market(f"asian_handicap_{line}")
+                            odds_data[key] = {"home": home, "away": away}
 
         except Exception as e:
             print(f"BetPawa error: {e}")
@@ -376,8 +395,39 @@ SCRAPER_MAP = {
     "betpawa": BetPawaScraper,
 }
 
-def get_scraper(platform: str) -> BaseScraper:
+def get_scraper(platform: str):
     scraper_class = SCRAPER_MAP.get(platform.lower())
     if not scraper_class:
         raise ValueError(f"No scraper for platform: {platform}")
     return scraper_class()
+
+
+# ── Debug utility ────────────────────────────────────────────────────────
+
+async def debug_1win_network(match_url: str):
+    """Print all JSON responses and their URLs for one minute."""
+    from playwright.async_api import async_playwright
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True)
+    page = await browser.new_page()
+
+    captured = []
+    async def log_response(response):
+        if "application/json" in response.headers.get("content-type", ""):
+            url = response.url
+            try:
+                body = await response.json()
+                captured.append((url, body))
+            except:
+                pass
+
+    page.on("response", log_response)
+    await page.goto(match_url, wait_until="domcontentloaded")
+    await page.wait_for_timeout(60000)
+
+    print(f"Captured {len(captured)} JSON responses:")
+    for url, body in captured[:10]:
+        print(f"\n--- {url} ---")
+        print(str(body)[:500])
+    await browser.close()
+    await pw.stop()
