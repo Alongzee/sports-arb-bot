@@ -1,3 +1,4 @@
 playwright
 httpx
 python-telegram-bot==21.5
+rapidfuzz
