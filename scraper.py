@@ -118,19 +118,18 @@ class SportyBetScraper:
         return odds_data
 
 
-# ─── 1win (Robust DOM scraping) ────────────────────────────────────────
+# ─── 1win (DOM polling – finds numbers, never times out) ───────────────
 
 class OneWinScraper(BaseScraper):
     """
-    1win odds are rendered inside a Vue.js SPA. No separate API endpoint.
-    Strategy: force en-US locale, wait for full render, then scrape all
-    visible text and DOM elements for odds patterns.
+    Scrapes 1win by polling the DOM for any visible numbers that look like odds.
+    Works regardless of language, template, or framework.
     """
 
     BASE_URL = "https://1wgcmt.com"
 
     async def _get_page_en_us(self, url: str):
-        """Create a page with en-US locale to get English labels."""
+        """Create a page with en-US locale to get English labels if present."""
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -148,57 +147,81 @@ class OneWinScraper(BaseScraper):
         try:
             pw, browser, page = await self._get_page_en_us(match_url)
 
-            # Wait for the page to fully load (SPA rendering takes time)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            # Extra wait for Vue.js to finish rendering odds
-            await page.wait_for_timeout(5000)
+            # Poll the DOM every 2 seconds for up to 40 seconds
+            potential_odds = []
+            for _ in range(20):
+                await page.wait_for_timeout(2000)
 
-            # Strategy 1: Look for any element that contains "Over" and a number nearby
-            # We'll grab all text nodes and parse patterns
-            text = await page.evaluate("document.body.innerText")
-
-            # ── Over/Under parsing ──────────────────────────────────────
-            over_under_regex = re.compile(
-                r"Over\s+(\d+\.?\d*)\s+(\d+\.\d{2})\s+Under\s+\1\s+(\d+\.\d{2})"
-            )
-            for match in over_under_regex.finditer(text):
-                line = match.group(1)
-                over = float(match.group(2))
-                under = float(match.group(3))
-                odds_data[f"over_under_{line}"] = {"over": over, "under": under}
-
-            # ── Handicap parsing ────────────────────────────────────────
-            asian_hcp_regex = re.compile(
-                r"(?:Asian\s+)?Handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})"
-            )
-            for match in asian_hcp_regex.finditer(text):
-                line = match.group(1)
-                home = float(match.group(2))
-                away = float(match.group(3))
-                odds_data[f"asian_handicap_{line}"] = {"home": home, "away": away}
-
-            # If text parsing failed, try DOM tree-walking for any odds-like numbers
-            if not odds_data:
-                all_text = await page.evaluate("""() => {
-                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                    const odds = [];
+                potential_odds = await page.evaluate("""() => {
+                    const walker = document.createTreeWalker(
+                        document.body,
+                        NodeFilter.SHOW_TEXT,
+                        null,
+                        false
+                    );
+                    const results = [];
                     let node;
                     while (node = walker.nextNode()) {
                         const text = node.textContent.trim();
-                        if (text && /^\d+\.\d{2}$/.test(text)) {
-                            const val = parseFloat(text);
+                        const match = text.match(/^(\\d+\\.\\d{2})$/);
+                        if (match) {
+                            const val = parseFloat(match[1]);
                             if (val >= 1.01 && val <= 1000) {
-                                odds.push(text);
+                                const parentText = node.parentElement?.textContent?.trim() || '';
+                                results.push({value: val, context: parentText});
                             }
                         }
                     }
-                    return odds;
+                    return results;
                 }""")
-                if all_text:
-                    print(f"1win: Found {len(all_text)} potential odds values: {all_text[:10]}...")
+
+                if len(potential_odds) >= 6:  # at least 3 pairs
+                    break
+
+            if potential_odds:
+                over_under_lines = {}
+                handicap_lines = {}
+
+                for item in potential_odds:
+                    ctx = item['context'].lower()
+                    val = item['value']
+
+                    # Over/Under pattern
+                    ou_match = re.search(r'(over|under)\s+(\d+\.?\d*)\s+(\d+\.\d{2})', ctx)
+                    if ou_match:
+                        direction = ou_match.group(1)
+                        line = ou_match.group(2)
+                        odd_val = float(ou_match.group(3))
+                        if line not in over_under_lines:
+                            over_under_lines[line] = {}
+                        over_under_lines[line][direction] = odd_val
+
+                    # Handicap pattern
+                    hcp_match = re.search(
+                        r'(?:asian\s+)?handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})',
+                        ctx
+                    )
+                    if hcp_match:
+                        line = hcp_match.group(1)
+                        home = float(hcp_match.group(2))
+                        away = float(hcp_match.group(3))
+                        handicap_lines[line] = {'home': home, 'away': away}
+
+                for line, sides in over_under_lines.items():
+                    if 'over' in sides and 'under' in sides:
+                        odds_data[f'over_under_{line}'] = {'over': sides['over'], 'under': sides['under']}
+
+                for line, sides in handicap_lines.items():
+                    odds_data[f'asian_handicap_{line}'] = sides
+
+            if not odds_data:
+                print(f'1win: Found {len(potential_odds)} potential odds values, but could not parse patterns.')
+                if potential_odds:
+                    for item in potential_odds[:5]:
+                        print(f'  {item["context"][:100]}...')
 
         except Exception as e:
-            print(f"1win error: {e}")
+            print(f'1win error: {e}')
         finally:
             if browser:
                 await browser.close()
@@ -361,33 +384,3 @@ def get_scraper(platform: str) -> BaseScraper:
     if not scraper_class:
         raise ValueError(f"No scraper for platform: {platform}")
     return scraper_class()
-
-
-# ── Debug utility ───────────────────────────────────────────────────────
-
-async def debug_1win_network(match_url: str):
-    """Print all JSON responses and their URLs for one minute."""
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=True)
-    page = await browser.new_page()
-
-    captured = []
-    async def log_response(response):
-        if "application/json" in response.headers.get("content-type", ""):
-            url = response.url
-            try:
-                body = await response.json()
-                captured.append((url, body))
-            except:
-                pass
-
-    page.on("response", log_response)
-    await page.goto(match_url, wait_until="domcontentloaded")
-    await page.wait_for_timeout(60000)  # 1 minute
-
-    print(f"Captured {len(captured)} JSON responses:")
-    for url, body in captured[:10]:
-        print(f"\n--- {url} ---")
-        print(str(body)[:500])
-    await browser.close()
-    await pw.stop()
