@@ -118,18 +118,17 @@ class SportyBetScraper:
         return odds_data
 
 
-# ─── 1win (Full text parsing – resilient to any layout) ────────────────
+# ─── 1win (Navigation‑proof, full‑text parsing) ─────────────────────────
 
 class OneWinScraper(BaseScraper):
     """
-    Scrapes 1win by waiting for odds numbers to appear, then parsing
-    the entire visible page text with robust regex patterns.
+    Scrapes 1win by waiting for odds to appear, then parsing
+    the visible page text – even if the page navigates away.
     """
 
     BASE_URL = "https://1wgcmt.com"
 
     async def _get_page_en_us(self, url: str):
-        """Create a page with en-US locale."""
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -137,6 +136,7 @@ class OneWinScraper(BaseScraper):
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
         )
         page = await context.new_page()
+        # Wait for the DOM to be ready – but don't wait for network idle (can timeout)
         await page.goto(url, wait_until="domcontentloaded")
         return pw, browser, page
 
@@ -147,76 +147,75 @@ class OneWinScraper(BaseScraper):
         try:
             pw, browser, page = await self._get_page_en_us(match_url)
 
-            # Wait until at least 6 decimal numbers appear (3 pairs)
-            for _ in range(20):
-                await page.wait_for_timeout(2000)
+            # Wait for the page to render (Vue.js SPA needs time)
+            # Single 8‑second wait is enough – no polling loops that break
+            await page.wait_for_timeout(8000)
 
-                count = await page.evaluate("""() => {
-                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                    let count = 0;
-                    let node;
-                    while (node = walker.nextNode()) {
-                        if (/^\\d+\\.\\d{2}$/.test(node.textContent.trim())) {
-                            const val = parseFloat(node.textContent.trim());
-                            if (val >= 1.01 && val <= 1000) count++;
-                        }
-                    }
-                    return count;
-                }""")
-                if count >= 6:
-                    break
+            # Try to get the full visible text; if the page navigated,
+            # we catch the error and use a fallback.
+            full_text = ""
+            try:
+                full_text = await page.evaluate("document.body.innerText")
+            except Exception as e:
+                print(f"1win: initial evaluate failed ({e}), trying page.content()...")
+                try:
+                    content = await page.content()
+                    # Extract text from HTML content using regex
+                    # Remove tags and keep only visible text
+                    full_text = re.sub(r'<[^>]+>', ' ', content)
+                    full_text = re.sub(r'\s+', ' ', full_text)
+                except Exception as e2:
+                    print(f"1win: page.content() also failed ({e2})")
+                    return odds_data
 
-            # Grab the entire visible text of the page
-            full_text = await page.evaluate("document.body.innerText")
+            # If we have text, parse it
+            if full_text:
+                # ── Over/Under lines ──────────────────────────────────────
+                ou_regex = re.compile(
+                    r'(?:^|\n|\s{2,})'
+                    r'(Over|Under)\s+(\d+\.?\d*)\s+(\d+\.\d{2})',
+                    re.IGNORECASE
+                )
+                for match in ou_regex.finditer(full_text):
+                    direction = match.group(1).lower()
+                    line      = match.group(2)
+                    odds_val  = float(match.group(3))
+                    key = f"over_under_{line}"
+                    if key not in odds_data:
+                        odds_data[key] = {}
+                    odds_data[key][direction] = odds_val
 
-            # ── Over/Under lines ──────────────────────────────────────────
-            # Patterns: "Over 2.5 1.72" / "Under 2.5 1.95"
-            ou_regex = re.compile(
-                r'(?:^|\n|\s{2,})'
-                r'(Over|Under)\s+(\d+\.?\d*)\s+(\d+\.\d{2})',
-                re.IGNORECASE
-            )
-            for match in ou_regex.finditer(full_text):
-                direction = match.group(1).lower()
-                line      = match.group(2)
-                odds_val  = float(match.group(3))
-                key = f"over_under_{line}"
-                if key not in odds_data:
-                    odds_data[key] = {}
-                odds_data[key][direction] = odds_val
+                # ── Asian Handicap lines ──────────────────────────────────
+                hcp_regex = re.compile(
+                    r'(?:Asian\s+)?Handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})',
+                    re.IGNORECASE
+                )
+                for match in hcp_regex.finditer(full_text):
+                    line = match.group(1)
+                    home = float(match.group(2))
+                    away = float(match.group(3))
+                    odds_data[f"asian_handicap_{line}"] = {"home": home, "away": away}
 
-            # ── Asian Handicap lines ──────────────────────────────────────
-            # "Asian Handicap -2.5 4.80 1.19"
-            hcp_regex = re.compile(
-                r'(?:Asian\s+)?Handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})',
-                re.IGNORECASE
-            )
-            for match in hcp_regex.finditer(full_text):
-                line = match.group(1)
-                home = float(match.group(2))
-                away = float(match.group(3))
-                odds_data[f"asian_handicap_{line}"] = {"home": home, "away": away}
+                # ── Total goals format (if different) ─────────────────────
+                total_regex = re.compile(
+                    r'Total\s+(\d+\.?\d*)\s+Over\s+(\d+\.\d{2})\s+Under\s+(\d+\.\d{2})',
+                    re.IGNORECASE
+                )
+                for match in total_regex.finditer(full_text):
+                    line = match.group(1)
+                    over = float(match.group(2))
+                    under = float(match.group(3))
+                    odds_data[f"over_under_{line}"] = {"over": over, "under": under}
 
-            # ── Total goals format (if different) ─────────────────────────
-            # "Total 2.5  Over 1.72 Under 1.95"
-            total_regex = re.compile(
-                r'Total\s+(\d+\.?\d*)\s+Over\s+(\d+\.\d{2})\s+Under\s+(\d+\.\d{2})',
-                re.IGNORECASE
-            )
-            for match in total_regex.finditer(full_text):
-                line = match.group(1)
-                over = float(match.group(2))
-                under = float(match.group(3))
-                odds_data[f"over_under_{line}"] = {"over": over, "under": under}
-
-            # Debug if nothing found
-            if not odds_data:
-                print("1win: Could not parse odds. Full page text (first 600 chars):")
-                print(full_text[:600])
-                all_nums = re.findall(r'\b\d+\.\d{2}\b', full_text)
-                print(f"Potential odds values found: {len(all_nums)}")
-                if all_nums:
-                    print(f"First 10: {all_nums[:10]}")
+                if not odds_data:
+                    all_nums = re.findall(r'\b\d+\.\d{2}\b', full_text)
+                    print(f"1win: Could not parse odds. Potential odds values: {len(all_nums)}")
+                    if all_nums:
+                        print(f"First 10: {all_nums[:10]}")
+                        print(f"Page text (first 400 chars):")
+                        print(full_text[:400])
+            else:
+                print("1win: no text extracted from page")
 
         except Exception as e:
             print(f'1win error: {e}')
@@ -381,4 +380,4 @@ def get_scraper(platform: str) -> BaseScraper:
     scraper_class = SCRAPER_MAP.get(platform.lower())
     if not scraper_class:
         raise ValueError(f"No scraper for platform: {platform}")
-    return scraper_class() 
+    return scraper_class()
