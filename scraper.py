@@ -5,6 +5,7 @@ All five platforms implemented. Returns standardised odds dictionaries.
 
 import asyncio
 import re
+import httpx
 from playwright.async_api import async_playwright
 
 
@@ -52,7 +53,6 @@ class SportyBetScraper:
             return None
 
     async def get_odds(self, match_url: str) -> dict:
-        import httpx
         odds_data = {}
 
         event_id = self._extract_event_id(match_url)
@@ -118,26 +118,141 @@ class SportyBetScraper:
         return odds_data
 
 
-# ─── 1win (text‑parsing, no fragile CSS) ───────────────────────────────
+# ─── 1win (Network interception + text fallback) ────────────────────────
 
 class OneWinScraper(BaseScraper):
-    BASE_URL = "https://1wgcmt.com/betting/match/sport"
+    """
+    1win is a Vue SPA. Odds are loaded via internal API calls.
+    We intercept those responses using Playwright's network capture.
+    Falls back to text‑parsing only if interception fails.
+    """
 
-    async def get_odds(self, match_url: str) -> dict:
+    BASE_URL = "https://1wgcmt.com"
+
+    # ── Strategy 1: Network interception ────────────────────────────────
+    async def _try_network_capture(self, page, match_url: str) -> dict:
+        """
+        Listens for all JSON responses. Returns the first response whose
+        body contains numbers that look like odds (>=1.01).
+        """
+        captured_data = {"found": False, "json": None}
+
+        async def handle_response(response):
+            if captured_data["found"]:
+                return
+            try:
+                if "application/json" not in response.headers.get("content-type", ""):
+                    return
+                body = await response.json()
+                if self._contains_odds_data(body):
+                    captured_data["found"] = True
+                    captured_data["json"] = body
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+
+        await page.goto(match_url, wait_until="domcontentloaded")
+        for _ in range(40):
+            if captured_data["found"]:
+                break
+            await page.wait_for_timeout(1000)
+        else:
+            return {}  # Timed out
+
+        raw = captured_data["json"]
+        if raw is None:
+            return {}
+        return self._parse_captured_json(raw)
+
+    def _contains_odds_data(self, obj) -> bool:
+        """Recursively search a JSON object for 3+ float values in the odds range."""
+        floats = []
+
+        def search(node):
+            if len(floats) >= 3:
+                return
+            if isinstance(node, (int, float)):
+                if 1.01 <= node <= 1000.0:
+                    floats.append(node)
+            elif isinstance(node, dict):
+                for v in node.values():
+                    search(v)
+            elif isinstance(node, list):
+                for v in node:
+                    search(v)
+
+        search(obj)
+        return len(floats) >= 3
+
+    def _parse_captured_json(self, json_data: dict) -> dict:
+        """Parse a generic JSON that contains odds."""
         odds_data = {}
-        pw, browser, page = await self._get_page(match_url)
+        self._extract_from_dict(json_data, odds_data)
+        return odds_data
+
+    def _extract_from_dict(self, obj, result: dict, prefix=""):
+        """Recursively walk a dictionary looking for odds patterns."""
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, (int, float)) and 1.01 <= value <= 1000.0:
+                    pass
+                elif isinstance(value, dict):
+                    self._extract_market(key, value, result)
+                elif isinstance(value, list):
+                    for item in value:
+                        self._extract_from_dict(item, result, f"{prefix}{key}.")
+                else:
+                    self._extract_from_dict(value, result, f"{prefix}{key}.")
+        elif isinstance(obj, list):
+            for item in obj:
+                self._extract_from_dict(item, result, prefix)
+
+    def _extract_market(self, market_name: str, odds_dict: dict, result: dict):
+        """Try to interpret a dict as a market with Over/Under or Home/Away odds."""
+        if not isinstance(odds_dict, dict):
+            return
+        # Over/Under
+        over_val = odds_dict.get("Over") or odds_dict.get("over")
+        under_val = odds_dict.get("Under") or odds_dict.get("under")
+        if over_val and under_val:
+            try:
+                over = float(over_val) if not isinstance(over_val, float) else over_val
+                under = float(under_val) if not isinstance(under_val, float) else under_val
+                try:
+                    float(market_name)
+                    key = f"over_under_{market_name}"
+                    result[key] = {"over": over, "under": under}
+                except ValueError:
+                    pass
+            except (ValueError, TypeError):
+                pass
+
+        # Handicap
+        home_val = odds_dict.get("Home") or odds_dict.get("home")
+        away_val = odds_dict.get("Away") or odds_dict.get("away")
+        if home_val and away_val:
+            try:
+                home = float(home_val) if not isinstance(home_val, float) else home_val
+                away = float(away_val) if not isinstance(away_val, float) else away_val
+                key = f"asian_handicap_{market_name}"
+                result[key] = {"home": home, "away": away}
+            except (ValueError, TypeError):
+                pass
+
+    # ── Strategy 2: Text parsing (fallback) ─────────────────────────────
+    async def _scrape_via_text(self, match_url: str, locale="en-US") -> dict:
+        """Fallback: force locale and parse visible text."""
+        odds_data = {}
+        pw, browser, page = await self._get_page_with_locale(match_url, locale)
 
         try:
-            # Wait for the word "Over" – a reliable signal that odds are loaded
-            await page.wait_for_selector("text=Over", timeout=15000)
-            # Extra delay for any late JavaScript
-            await page.wait_for_timeout(2000)
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(5000)
 
-            # Grab all visible text
             text = await page.evaluate("document.body.innerText")
 
-            # ── Over/Under lines ──────────────────────────────────────────
-            # Pattern: "Over 2.5 1.72  Under 2.5 1.95" (many variations)
+            # Over/Under
             over_under_regex = re.compile(
                 r"Over\s+(\d+\.?\d*)\s+(\d+\.\d{2})\s+Under\s+\1\s+(\d+\.\d{2})"
             )
@@ -147,8 +262,7 @@ class OneWinScraper(BaseScraper):
                 under = float(match.group(3))
                 odds_data[f"over_under_{line}"] = {"over": over, "under": under}
 
-            # ── Asian Handicap lines ──────────────────────────────────────
-            # Pattern: "Handicap -2.5 4.80 1.19" or "Asian Handicap -2.5 4.80 1.19"
+            # Asian Handicap
             asian_hcp_regex = re.compile(
                 r"(?:Asian\s+)?Handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})"
             )
@@ -159,12 +273,58 @@ class OneWinScraper(BaseScraper):
                 odds_data[f"asian_handicap_{line}"] = {"home": home, "away": away}
 
         except Exception as e:
-            print(f"1win error: {e}")
+            print(f"1win text fallback error: {e}")
         finally:
             await browser.close()
             await pw.stop()
 
         return odds_data
+
+    async def _get_page_with_locale(self, url: str, locale: str):
+        """Create a page with a specific locale."""
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            locale=locale,
+            extra_http_headers={"Accept-Language": f"{locale},en;q=0.9"}
+        )
+        page = await context.new_page()
+        await page.goto(url, wait_until="domcontentloaded")
+        return pw, browser, page
+
+    # ── Main entry point ────────────────────────────────────────────────
+    async def get_odds(self, match_url: str) -> dict:
+        pw = browser = page = None
+        result = {}
+
+        try:
+            pw = await async_playwright().start()
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(
+                locale="en-US",
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
+            )
+            page = await context.new_page()
+
+            network_result = await self._try_network_capture(page, match_url)
+            if network_result:
+                return network_result
+        except Exception as e:
+            print(f"1win network interception failed: {e}")
+        finally:
+            if browser:
+                await browser.close()
+            if pw:
+                await pw.stop()
+
+        # Strategy 2: Text parsing with English locale
+        result = await self._scrape_via_text(match_url, locale="en-US")
+        if result:
+            return result
+
+        # Strategy 3: Text parsing with default locale
+        result = await self._scrape_via_text(match_url, locale="zh-CN")
+        return result
 
 
 # ─── Betway ─────────────────────────────────────────────────────────────
@@ -219,7 +379,7 @@ class BetwayScraper(BaseScraper):
         return odds_data
 
 
-# ─── BetWinner ───────────────────────────────────────────────────────────
+# ─── BetWinner ─────────────────────────────────────────────────────────
 
 class BetWinnerScraper(BaseScraper):
     BASE_URL = "https://betwinner.com.gh"
@@ -262,7 +422,7 @@ class BetWinnerScraper(BaseScraper):
         return odds_data
 
 
-# ─── BetPawa ─────────────────────────────────────────────────────────────
+# ─── BetPawa ───────────────────────────────────────────────────────────
 
 class BetPawaScraper(BaseScraper):
     BASE_URL = "https://betpawa.com.gh"
