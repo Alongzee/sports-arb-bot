@@ -118,157 +118,46 @@ class SportyBetScraper:
         return odds_data
 
 
-# ─── 1win (Network interception + text fallback) ────────────────────────
+# ─── 1win (Robust DOM scraping) ────────────────────────────────────────
 
 class OneWinScraper(BaseScraper):
     """
-    1win scrapes via:
-      1) Direct API call to common internal endpoints (if available)
-      2) Playwright network interception – listens for JSON responses whose URL
-         matches typical odds-data patterns.
-      3) Text parsing on the fully‑loaded page (fallback).
+    1win odds are rendered inside a Vue.js SPA. No separate API endpoint.
+    Strategy: force en-US locale, wait for full render, then scrape all
+    visible text and DOM elements for odds patterns.
     """
 
     BASE_URL = "https://1wgcmt.com"
 
-    API_PATTERNS = [
-        "/line/",
-        "/event/",
-        "/odds/",
-        "/market/",
-        "/sport/",
-        "/betting/",
-    ]
+    async def _get_page_en_us(self, url: str):
+        """Create a page with en-US locale to get English labels."""
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            locale="en-US",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
+        )
+        page = await context.new_page()
+        await page.goto(url, wait_until="domcontentloaded")
+        return pw, browser, page
 
-    async def _try_direct_api(self, match_url: str) -> dict:
-        """Attempt to call known 1win API endpoints directly."""
-        m = re.search(r'[-/](\d{5,})', match_url)
-        if not m:
-            return {}
-        event_id = m.group(1)
-
-        async with httpx.AsyncClient(timeout=10) as client:
-            for pattern in self.API_PATTERNS:
-                url = f"{self.BASE_URL}/api/v1/sport{pattern}{event_id}"
-                try:
-                    r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                    if r.status_code == 200:
-                        data = r.json()
-                        if self._contains_odds_data(data):
-                            return self._parse_captured_json(data)
-                except Exception:
-                    continue
-        return {}
-
-    async def _try_network_capture(self, page, match_url: str) -> dict:
-        """Listens for JSON responses whose URL contains any of the API_PATTERNS."""
-        captured_data = {"found": False, "json": None}
-
-        async def handle_response(response):
-            if captured_data["found"]:
-                return
-            try:
-                if "application/json" not in response.headers.get("content-type", ""):
-                    return
-                url = response.url
-                if not any(pattern in url for pattern in self.API_PATTERNS):
-                    return
-                body = await response.json()
-                if self._contains_odds_data(body):
-                    captured_data["found"] = True
-                    captured_data["json"] = body
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
-        await page.goto(match_url, wait_until="domcontentloaded")
-        for _ in range(30):
-            if captured_data["found"]:
-                break
-            await page.wait_for_timeout(1000)
-
-        if captured_data["json"]:
-            return self._parse_captured_json(captured_data["json"])
-        return {}
-
-    def _contains_odds_data(self, obj) -> bool:
-        """Recursively search a JSON object for 3+ float values in the odds range."""
-        floats = []
-
-        def search(node):
-            if len(floats) >= 3:
-                return
-            if isinstance(node, (int, float)):
-                if 1.01 <= node <= 1000.0:
-                    floats.append(node)
-            elif isinstance(node, dict):
-                for v in node.values():
-                    search(v)
-            elif isinstance(node, list):
-                for v in node:
-                    search(v)
-
-        search(obj)
-        return len(floats) >= 3
-
-    def _parse_captured_json(self, json_data: dict) -> dict:
-        """Parse a generic JSON that contains odds."""
+    async def get_odds(self, match_url: str) -> dict:
         odds_data = {}
-        self._extract_from_dict(json_data, odds_data)
-        return odds_data
+        pw = browser = page = None
 
-    def _extract_from_dict(self, obj, result: dict, prefix=""):
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if isinstance(value, (int, float)) and 1.01 <= value <= 1000.0:
-                    pass
-                elif isinstance(value, dict):
-                    self._extract_market(key, value, result)
-                elif isinstance(value, list):
-                    for item in value:
-                        self._extract_from_dict(item, result, f"{prefix}{key}.")
-                else:
-                    self._extract_from_dict(value, result, f"{prefix}{key}.")
-        elif isinstance(obj, list):
-            for item in obj:
-                self._extract_from_dict(item, result, prefix)
-
-    def _extract_market(self, market_name: str, odds_dict: dict, result: dict):
-        if not isinstance(odds_dict, dict):
-            return
-        over_val = odds_dict.get("Over") or odds_dict.get("over")
-        under_val = odds_dict.get("Under") or odds_dict.get("under")
-        if over_val and under_val:
-            try:
-                over = float(over_val) if not isinstance(over_val, float) else over_val
-                under = float(under_val) if not isinstance(under_val, float) else under_val
-                try:
-                    float(market_name)
-                    result[f"over_under_{market_name}"] = {"over": over, "under": under}
-                except ValueError:
-                    pass
-            except (ValueError, TypeError):
-                pass
-
-        home_val = odds_dict.get("Home") or odds_dict.get("home")
-        away_val = odds_dict.get("Away") or odds_dict.get("away")
-        if home_val and away_val:
-            try:
-                home = float(home_val) if not isinstance(home_val, float) else home_val
-                away = float(away_val) if not isinstance(away_val, float) else away_val
-                result[f"asian_handicap_{market_name}"] = {"home": home, "away": away}
-            except (ValueError, TypeError):
-                pass
-
-    async def _scrape_via_text(self, match_url: str, locale="en-US") -> dict:
-        """Fallback: force locale and parse visible text."""
-        odds_data = {}
-        pw, browser, page = await self._get_page_with_locale(match_url, locale)
         try:
-            await page.wait_for_load_state("networkidle")
+            pw, browser, page = await self._get_page_en_us(match_url)
+
+            # Wait for the page to fully load (SPA rendering takes time)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+            # Extra wait for Vue.js to finish rendering odds
             await page.wait_for_timeout(5000)
 
+            # Strategy 1: Look for any element that contains "Over" and a number nearby
+            # We'll grab all text nodes and parse patterns
             text = await page.evaluate("document.body.innerText")
+
+            # ── Over/Under parsing ──────────────────────────────────────
             over_under_regex = re.compile(
                 r"Over\s+(\d+\.?\d*)\s+(\d+\.\d{2})\s+Under\s+\1\s+(\d+\.\d{2})"
             )
@@ -278,6 +167,7 @@ class OneWinScraper(BaseScraper):
                 under = float(match.group(3))
                 odds_data[f"over_under_{line}"] = {"over": over, "under": under}
 
+            # ── Handicap parsing ────────────────────────────────────────
             asian_hcp_regex = re.compile(
                 r"(?:Asian\s+)?Handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})"
             )
@@ -286,57 +176,36 @@ class OneWinScraper(BaseScraper):
                 home = float(match.group(2))
                 away = float(match.group(3))
                 odds_data[f"asian_handicap_{line}"] = {"home": home, "away": away}
+
+            # If text parsing failed, try DOM tree-walking for any odds-like numbers
+            if not odds_data:
+                all_text = await page.evaluate("""() => {
+                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                    const odds = [];
+                    let node;
+                    while (node = walker.nextNode()) {
+                        const text = node.textContent.trim();
+                        if (text && /^\d+\.\d{2}$/.test(text)) {
+                            const val = parseFloat(text);
+                            if (val >= 1.01 && val <= 1000) {
+                                odds.push(text);
+                            }
+                        }
+                    }
+                    return odds;
+                }""")
+                if all_text:
+                    print(f"1win: Found {len(all_text)} potential odds values: {all_text[:10]}...")
+
         except Exception as e:
-            print(f"1win text fallback error: {e}")
-        finally:
-            await browser.close()
-            await pw.stop()
-        return odds_data
-
-    async def _get_page_with_locale(self, url: str, locale: str):
-        pw = await async_playwright().start()
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            locale=locale,
-            extra_http_headers={"Accept-Language": f"{locale},en;q=0.9"}
-        )
-        page = await context.new_page()
-        await page.goto(url, wait_until="domcontentloaded")
-        return pw, browser, page
-
-    async def get_odds(self, match_url: str) -> dict:
-        # 1) Try direct API call first – fastest
-        odds = await self._try_direct_api(match_url)
-        if odds:
-            return odds
-
-        # 2) Network interception with URL filtering
-        pw = browser = page = None
-        try:
-            pw = await async_playwright().start()
-            browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context(
-                locale="en-US",
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
-            )
-            page = await context.new_page()
-            odds = await self._try_network_capture(page, match_url)
-            if odds:
-                return odds
-        except Exception as e:
-            print(f"Network capture error: {e}")
+            print(f"1win error: {e}")
         finally:
             if browser:
                 await browser.close()
             if pw:
                 await pw.stop()
 
-        # 3) Text fallback
-        odds = await self._scrape_via_text(match_url, locale="en-US")
-        if odds:
-            return odds
-        odds = await self._scrape_via_text(match_url, locale="zh-CN")
-        return odds
+        return odds_data
 
 
 # ─── Betway ─────────────────────────────────────────────────────────────
@@ -498,7 +367,6 @@ def get_scraper(platform: str) -> BaseScraper:
 
 async def debug_1win_network(match_url: str):
     """Print all JSON responses and their URLs for one minute."""
-    from playwright.async_api import async_playwright
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(headless=True)
     page = await browser.new_page()
@@ -522,4 +390,4 @@ async def debug_1win_network(match_url: str):
         print(f"\n--- {url} ---")
         print(str(body)[:500])
     await browser.close()
-    await pw.stop() 
+    await pw.stop()
