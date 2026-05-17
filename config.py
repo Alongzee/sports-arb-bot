@@ -16,8 +16,8 @@ BOOKMAKER_YOU    = "1win"
 BOOKMAKER_FRIEND = "sportybet"
 
 # ── Active Hours (UTC) ────────────────────────────────────────────────────
-ACTIVE_START   = 6    # 6 AM
-ACTIVE_END     = 18   # 6 PM
+ACTIVE_START   = 0    # 6 AM
+ACTIVE_END     = 24   # 6 PM
 
 # ── Bankroll & Staking ────────────────────────────────────────────────────
 TOTAL_BANKROLL = 100.0          # GHS – split across both accounts

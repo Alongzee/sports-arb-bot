@@ -123,7 +123,7 @@ def format_arb_alert(
     settle = _settlement_label(speed)
     speed_str = _speed_label(speed)
     stab_str  = _stability_label(stability)
-    profit    = round(stake_you + stake_friend - (stake_you * odds_you), 2)
+    profit    = round((stake_you * odds_you) - stake_you - stake_friend, 2)
 
     lines = [
         f"📊 *ARB #{arb_id}* | Priority: {score['final_score']:.0%}",

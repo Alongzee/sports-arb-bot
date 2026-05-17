@@ -328,24 +328,92 @@ class OneWinScraper:
         return odds_data
 
     def _parse_dom_text(self, text: str) -> dict:
-        """Fallback DOM text parser."""
+        """Parse 1win page text - collects all Over/Under and pairs them."""
         odds_data = {}
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        
+        # First pass: collect all individual Over/Under entries
+        ou_collected = {}  # {line_val: {over: x, under: y}}
 
-        # Over/Under
-        for match in re.finditer(r"Over\s+(\d+\.?\d*)\s+(\d+\.\d{2})\s+Under\s+\1\s+(\d+\.\d{2})", text):
-            line = match.group(1)
-            over = float(match.group(2))
-            under = float(match.group(3))
-            key = normalise_market(f"over_under_{line}")
-            odds_data[key] = {"over": over, "under": under}
+        i = 0
+        while i < len(lines):
+            line = lines[i]
 
-        # Asian Handicap
-        for match in re.finditer(r"(?:Asian\s+)?Handicap\s+([+-]?\d+\.?\d*)\s+(\d+\.\d{2})\s+(\d+\.\d{2})", text):
-            line = match.group(1)
-            home = float(match.group(2))
-            away = float(match.group(3))
-            key = normalise_market(f"asian_handicap_{line}")
-            odds_data[key] = {"home": home, "away": away}
+            # Skip AI tips and descriptive lines
+            if (line.startswith("AI tips") or
+                line.startswith("In ") or
+                line.startswith("of the last") or
+                len(line) > 80 or
+                re.match(r"^[A-Z][a-z]+ (has|have|scored|conceded|didn|didn't|lost|won)", line)):
+                i += 1
+                continue
+
+            # Total (Over/Under): "Total" -> "Over X.X" or "Under X.X" -> odds
+            if line == "Total" and i + 2 < len(lines):
+                dir_line = lines[i + 1]
+                odds_line = lines[i + 2]
+                m = re.match(r"(Over|Under)\s+(\d+\.?\d*)", dir_line)
+                o = re.match(r"^(\d+\.\d+)$", odds_line)
+                if m and o:
+                    direction = m.group(1).lower()
+                    val = m.group(2)
+                    if val not in ou_collected:
+                        ou_collected[val] = {}
+                    ou_collected[val][direction] = float(o.group(1))
+                    i += 3
+                    continue
+
+            # Handicap
+            if line in ("Handicap", "Asian Handicap") and i + 3 < len(lines):
+                val_line = lines[i + 1]
+                home_line = lines[i + 2]
+                away_line = lines[i + 3]
+                vm = re.match(r"([+-]?\d+\.?\d*)", val_line)
+                hm = re.match(r"^(\d+\.\d+)$", home_line)
+                am = re.match(r"^(\d+\.\d+)$", away_line)
+                if vm and hm and am:
+                    key = normalise_market(f"asian_handicap_{vm.group(1)}")
+                    odds_data[key] = {"home": float(hm.group(1)), "away": float(am.group(1))}
+                    i += 4
+                    continue
+
+            # Both teams to score
+            if "both teams to score" in line.lower() and i + 2 < len(lines):
+                side = lines[i + 1].lower()
+                om = re.match(r"^(\d+\.\d+)$", lines[i + 2])
+                if om and side in ("yes", "no"):
+                    key = normalise_market("both_to_score")
+                    if key not in odds_data:
+                        odds_data[key] = {}
+                    odds_data[key][side] = float(om.group(1))
+                    i += 3
+                    continue
+
+            i += 1
+
+        # Pair collected Over/Under entries (from AI tips section)
+        for val, sides in ou_collected.items():
+            if len(sides) == 2:
+                key = normalise_market(f"over_under_{val}")
+                odds_data[key] = sides
+
+        # Second pass: parse the full market table (appears after navigation tabs)
+        # Format: "Under 0.5\n10.7\nOver 0.5\n1.43\nUnder 1.5\n..."
+        # Find the market table section
+        full_text = "\n".join(lines)
+        
+        # Parse consecutive Over/Under pairs from market table
+        table_pattern = re.finditer(
+            r"(Over|Under)\s+(\d+\.?\d*)\n(\d+\.\d+)\n(Over|Under)\s+\2\n(\d+\.\d+)",
+            full_text
+        )
+        for m in table_pattern:
+            dir1, val, odds1, dir2, odds2 = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+            key = normalise_market(f"over_under_{val}")
+            odds_data[key] = {
+                dir1.lower(): float(odds1),
+                dir2.lower(): float(odds2)
+            }
 
         return odds_data
 

@@ -23,7 +23,7 @@ from alerter import send_status, send_arb_alert
 log = logging.getLogger("commands")
 
 # ── Replace with your actual Telegram user IDs ────────────────────────────
-YOUR_TELEGRAM_ID   = 123456789   # TODO: get from @userinfobot
+YOUR_TELEGRAM_ID   = 7277537180   # TODO: get from @userinfobot
 FRIEND_TELEGRAM_ID = 987654321   # TODO: get from @userinfobot
 
 # ── Shared bot state ──────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ class BotState:
         return (
             self.alerts_enabled
             and not self.paused
-            and len(self.available) == 2
+            and True
             and datetime.now(timezone.utc).weekday() not in COOL_OFF_DAYS
         )
 
