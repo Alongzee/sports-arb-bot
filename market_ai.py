@@ -1,7 +1,16 @@
 """
-market_ai.py – Cross‑market relationship mapping, settlement speed,
-               stability scoring, and three‑factor priority scoring.
-Covers Football, Basketball, Tennis, Table Tennis.
+market_ai.py – Canonical market intelligence layer.
+
+Responsibilities:
+- Settlement speed classification
+- Stability scoring
+- Priority scoring
+- Cross-market relationship mapping
+- Canonical market metadata registry
+
+This file MUST remain pure logic only.
+No scraper logic.
+No bookmaker logic.
 """
 
 from __future__ import annotations
@@ -9,207 +18,444 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-# ── Settlement speed constants (used for scoring) ─────────────────────────
-ULTRA_FAST = 0   # ~1‑10 min  (point, game, 10‑min interval)
-FAST       = 1   # ~12‑45 min (quarter, 1st half, set, next goal)
-MEDIUM     = 2   # ~45‑90 min (2nd half, full match without OT)
-SLOW       = 3   # >90 min    (full match with OT, full tennis match)
+
+# ════════════════════════════════════════════════════════════════════════
+# SPEED CONSTANTS
+# ════════════════════════════════════════════════════════════════════════
+
+ULTRA_FAST = 0
+FAST = 1
+MEDIUM = 2
+SLOW = 3
+
 
 SPEED_SCORES = {
     ULTRA_FAST: 1.0,
-    FAST:       0.8,
-    MEDIUM:     0.4,
-    SLOW:       0.1,
+    FAST: 0.8,
+    MEDIUM: 0.4,
+    SLOW: 0.1,
 }
 
-# ── Stability scores ──────────────────────────────────────────────────────
-STABILITY_HIGH   = 1.0   # pre‑match 10‑30 min to kickoff
-STABILITY_MEDIUM = 0.6   # pre‑match 30‑60 min, live early minutes
-STABILITY_LOW    = 0.2   # live late game
 
-# ── Three‑factor scoring weights (mirrors config.py) ─────────────────────
-WEIGHT_MARGIN    = 0.5
-WEIGHT_SPEED     = 0.4
+# ════════════════════════════════════════════════════════════════════════
+# STABILITY
+# ════════════════════════════════════════════════════════════════════════
+
+STABILITY_HIGH = 1.0
+STABILITY_MEDIUM = 0.6
+STABILITY_LOW = 0.2
+
+
+# ════════════════════════════════════════════════════════════════════════
+# PRIORITY WEIGHTS
+# ════════════════════════════════════════════════════════════════════════
+
+WEIGHT_MARGIN = 0.5
+WEIGHT_SPEED = 0.4
 WEIGHT_STABILITY = 0.1
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  MARKET DEFINITIONS
-# ═══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+# MARKET DEFINITIONS
+# ════════════════════════════════════════════════════════════════════════
 
-@dataclass
+@dataclass(frozen=True)
 class MarketDef:
-    """
-    Describes a single two‑way market.
-    """
     sport: str
-    market_key: str              # standard key used everywhere (e.g. "over_under")
-    display_name: str            # human‑readable
-    settlement_speed: int        # one of ULTRA_FAST/FAST/MEDIUM/SLOW
-    # The labels that different platforms might use – already handled by
-    # matcher.normalise_market().  We list them here as documentation only.
-    sportybet_labels: List[str] = None
-    onewin_labels: List[str] = None
-
-    def __post_init__(self):
-        if self.sportybet_labels is None:
-            self.sportybet_labels = []
-        if self.onewin_labels is None:
-            self.onewin_labels = []
+    market_key: str
+    display_name: str
+    settlement_speed: int
+    category: str
+    supported_outcomes: Tuple[str, ...]
 
 
-# ── All two‑way markets per sport ──────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════
+# FOOTBALL
+# ════════════════════════════════════════════════════════════════════════
 
 FOOTBALL_MARKETS: List[MarketDef] = [
-    # Full match
-    MarketDef("football", "over_under",          "Over/Under Goals",          SLOW),
-    MarketDef("football", "asian_handicap",      "Asian Handicap",            SLOW),
-    MarketDef("football", "double_chance",       "Double Chance",             SLOW),
-    MarketDef("football", "both_to_score",       "Both Teams to Score",       SLOW),
-    MarketDef("football", "odd_even",            "Odd/Even Goals",            SLOW),
-    MarketDef("football", "draw_no_bet",         "Draw No Bet",               SLOW),
-    MarketDef("football", "handicap_3way",       "Handicap (3‑Way)",          SLOW),
-    MarketDef("football", "winner",              "Match Winner",              SLOW),
-    # Fast / Ultra‑fast
-    MarketDef("football", "over_under_10min",    "10‑Min Over/Under",         ULTRA_FAST),
-    MarketDef("football", "over_under_1st_half", "1st Half Over/Under",       FAST),
-    MarketDef("football", "asian_handicap_1st_half", "1st Half Asian Handicap", FAST),
-    MarketDef("football", "both_to_score_1st_half", "1st Half Both to Score", FAST),
-    MarketDef("football", "next_goal_2way",      "Next Goal (2‑Way)",         ULTRA_FAST),
-    MarketDef("football", "over_under_2nd_half", "2nd Half Over/Under",       MEDIUM),
-    # Corners
-    MarketDef("football", "corners_over_under",  "Corners Over/Under",        SLOW),
-    MarketDef("football", "corners_asian_handicap", "Corners Asian Handicap", SLOW),
-    # 5/10/15 min intervals
-    MarketDef("football", "interval_over_under",  "Interval Over/Under",      ULTRA_FAST),
+
+    MarketDef(
+        sport="football",
+        market_key="winner",
+        display_name="Match Winner",
+        settlement_speed=SLOW,
+        category="moneyline",
+        supported_outcomes=("home", "draw", "away"),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="over_under",
+        display_name="Over/Under Goals",
+        settlement_speed=SLOW,
+        category="total",
+        supported_outcomes=("over", "under"),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="asian_handicap",
+        display_name="Asian Handicap",
+        settlement_speed=SLOW,
+        category="spread",
+        supported_outcomes=("home", "away"),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="both_to_score",
+        display_name="Both Teams To Score",
+        settlement_speed=SLOW,
+        category="prop",
+        supported_outcomes=("yes", "no"),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="double_chance",
+        display_name="Double Chance",
+        settlement_speed=SLOW,
+        category="combo",
+        supported_outcomes=(
+            "home_or_draw",
+            "home_or_away",
+            "draw_or_away",
+        ),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="draw_no_bet",
+        display_name="Draw No Bet",
+        settlement_speed=SLOW,
+        category="moneyline",
+        supported_outcomes=("home", "away"),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="odd_even",
+        display_name="Odd/Even Goals",
+        settlement_speed=SLOW,
+        category="prop",
+        supported_outcomes=("odd", "even"),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="over_under_1st_half",
+        display_name="1st Half Over/Under",
+        settlement_speed=FAST,
+        category="total",
+        supported_outcomes=("over", "under"),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="asian_handicap_1st_half",
+        display_name="1st Half Asian Handicap",
+        settlement_speed=FAST,
+        category="spread",
+        supported_outcomes=("home", "away"),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="next_goal_2way",
+        display_name="Next Goal",
+        settlement_speed=ULTRA_FAST,
+        category="prop",
+        supported_outcomes=("home", "away"),
+    ),
+
+    MarketDef(
+        sport="football",
+        market_key="interval_over_under",
+        display_name="Interval Over/Under",
+        settlement_speed=ULTRA_FAST,
+        category="total",
+        supported_outcomes=("over", "under"),
+    ),
 ]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# BASKETBALL
+# ════════════════════════════════════════════════════════════════════════
 
 BASKETBALL_MARKETS: List[MarketDef] = [
-    MarketDef("basketball", "winner_full",        "Winner (no OT)",           SLOW),
-    MarketDef("basketball", "over_under_full",    "Over/Under (no OT)",       SLOW),
-    MarketDef("basketball", "handicap_full",      "Handicap (no OT)",         SLOW),
-    MarketDef("basketball", "winner_incl_ot",     "Winner (incl. OT)",        SLOW),
-    MarketDef("basketball", "over_under_incl_ot", "Over/Under (incl. OT)",    SLOW),
-    MarketDef("basketball", "handicap_incl_ot",   "Handicap (incl. OT)",      SLOW),
-    MarketDef("basketball", "odd_even_incl_ot",   "Odd/Even (incl. OT)",      SLOW),
-    MarketDef("basketball", "quarter_over_under", "Quarter Over/Under",       FAST),
-    MarketDef("basketball", "quarter_handicap",   "Quarter Handicap",         FAST),
-    MarketDef("basketball", "quarter_winner",     "Quarter Winner",           FAST),
-    MarketDef("basketball", "half_over_under",    "Half Over/Under",          MEDIUM),
-    MarketDef("basketball", "half_handicap",      "Half Handicap",            MEDIUM),
-    MarketDef("basketball", "player_points",      "Player Points Over/Under", SLOW),
+
+    MarketDef(
+        sport="basketball",
+        market_key="winner_full",
+        display_name="Winner",
+        settlement_speed=SLOW,
+        category="moneyline",
+        supported_outcomes=("home", "away"),
+    ),
+
+    MarketDef(
+        sport="basketball",
+        market_key="over_under_full",
+        display_name="Total Points",
+        settlement_speed=SLOW,
+        category="total",
+        supported_outcomes=("over", "under"),
+    ),
+
+    MarketDef(
+        sport="basketball",
+        market_key="handicap_full",
+        display_name="Spread",
+        settlement_speed=SLOW,
+        category="spread",
+        supported_outcomes=("home", "away"),
+    ),
+
+    MarketDef(
+        sport="basketball",
+        market_key="quarter_over_under",
+        display_name="Quarter Total",
+        settlement_speed=FAST,
+        category="total",
+        supported_outcomes=("over", "under"),
+    ),
+
+    MarketDef(
+        sport="basketball",
+        market_key="quarter_handicap",
+        display_name="Quarter Handicap",
+        settlement_speed=FAST,
+        category="spread",
+        supported_outcomes=("home", "away"),
+    ),
 ]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TENNIS
+# ════════════════════════════════════════════════════════════════════════
 
 TENNIS_MARKETS: List[MarketDef] = [
-    MarketDef("tennis", "winner",                "Match Winner",             SLOW),
-    MarketDef("tennis", "game_handicap",         "Game Handicap",            SLOW),
-    MarketDef("tennis", "total_games",           "Total Games Over/Under",   SLOW),
-    MarketDef("tennis", "odd_even_games",        "Odd/Even Games",           SLOW),
-    MarketDef("tennis", "set_winner",            "Set Winner",               FAST),
-    MarketDef("tennis", "set_total_games",       "Set Total Games Over/Under", FAST),
-    MarketDef("tennis", "set_game_handicap",     "Set Game Handicap",        FAST),
-    MarketDef("tennis", "tiebreak_in_match",     "Tiebreak in Match?",       SLOW),
-    MarketDef("tennis", "tiebreak_in_set",       "Tiebreak in Set?",         FAST),
-    MarketDef("tennis", "game_winner",           "Game Winner",              ULTRA_FAST),
-    MarketDef("tennis", "game_to_deuce",         "Game to Deuce?",           ULTRA_FAST),
-    MarketDef("tennis", "player_to_win_a_set",   "Player to Win a Set",      SLOW),
+
+    MarketDef(
+        sport="tennis",
+        market_key="winner",
+        display_name="Match Winner",
+        settlement_speed=SLOW,
+        category="moneyline",
+        supported_outcomes=("player1", "player2"),
+    ),
+
+    MarketDef(
+        sport="tennis",
+        market_key="total_games",
+        display_name="Total Games",
+        settlement_speed=SLOW,
+        category="total",
+        supported_outcomes=("over", "under"),
+    ),
+
+    MarketDef(
+        sport="tennis",
+        market_key="game_handicap",
+        display_name="Game Handicap",
+        settlement_speed=SLOW,
+        category="spread",
+        supported_outcomes=("player1", "player2"),
+    ),
+
+    MarketDef(
+        sport="tennis",
+        market_key="set_winner",
+        display_name="Set Winner",
+        settlement_speed=FAST,
+        category="moneyline",
+        supported_outcomes=("player1", "player2"),
+    ),
+
+    MarketDef(
+        sport="tennis",
+        market_key="game_winner",
+        display_name="Game Winner",
+        settlement_speed=ULTRA_FAST,
+        category="moneyline",
+        supported_outcomes=("player1", "player2"),
+    ),
 ]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# TABLE TENNIS
+# ════════════════════════════════════════════════════════════════════════
 
 TABLE_TENNIS_MARKETS: List[MarketDef] = [
-    MarketDef("table_tennis", "winner",           "Match Winner",            FAST),
-    MarketDef("table_tennis", "point_handicap",   "Point Handicap",          FAST),
-    MarketDef("table_tennis", "total_points",     "Total Points Over/Under", FAST),
-    MarketDef("table_tennis", "game_odd_even",    "Game Odd/Even",          ULTRA_FAST),
-    MarketDef("table_tennis", "race_to_points",   "Race to X Points",       ULTRA_FAST),
+
+    MarketDef(
+        sport="table_tennis",
+        market_key="winner",
+        display_name="Winner",
+        settlement_speed=FAST,
+        category="moneyline",
+        supported_outcomes=("player1", "player2"),
+    ),
+
+    MarketDef(
+        sport="table_tennis",
+        market_key="total_points",
+        display_name="Total Points",
+        settlement_speed=FAST,
+        category="total",
+        supported_outcomes=("over", "under"),
+    ),
+
+    MarketDef(
+        sport="table_tennis",
+        market_key="point_handicap",
+        display_name="Point Handicap",
+        settlement_speed=FAST,
+        category="spread",
+        supported_outcomes=("player1", "player2"),
+    ),
 ]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# REGISTRY
+# ════════════════════════════════════════════════════════════════════════
 
 ALL_MARKETS: Dict[str, List[MarketDef]] = {
-    "football":      FOOTBALL_MARKETS,
-    "basketball":    BASKETBALL_MARKETS,
-    "tennis":        TENNIS_MARKETS,
-    "table_tennis":  TABLE_TENNIS_MARKETS,
+    "football": FOOTBALL_MARKETS,
+    "basketball": BASKETBALL_MARKETS,
+    "tennis": TENNIS_MARKETS,
+    "table_tennis": TABLE_TENNIS_MARKETS,
 }
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CROSS‑MARKET PAIRS
-# ═══════════════════════════════════════════════════════════════════════════
 
-# Format: (sport, market_key_A, platform_A_outcome, market_key_B, platform_B_outcome)
-# "outcome" is either "home"/"over"/"yes" or "away"/"under"/"no"
-CROSS_MARKET_PAIRS: List[Tuple[str, str, str, str, str]] = [
-    # Football
-    ("football", "double_chance", "home_or_draw", "winner", "away"),
-    ("football", "double_chance", "home_or_away", "winner", "draw"),
-    ("football", "double_chance", "draw_or_away", "winner", "home"),
-    # Tennis
-    ("tennis", "tiebreak_in_match", "yes", "tiebreak_in_match", "no"),
-    ("tennis", "tiebreak_in_set", "yes", "tiebreak_in_set", "no"),
-    ("tennis", "game_to_deuce", "yes", "game_to_deuce", "no"),
-    # Basketball
-    ("basketball", "odd_even_incl_ot", "odd", "odd_even_incl_ot", "even"),
-    # Table Tennis
-    ("table_tennis", "game_odd_even", "odd", "game_odd_even", "even"),
+# Fast lookup cache
+_MARKET_CACHE: Dict[Tuple[str, str], MarketDef] = {}
+
+for sport, defs in ALL_MARKETS.items():
+    for m in defs:
+        _MARKET_CACHE[(sport, m.market_key)] = m
+
+
+# ════════════════════════════════════════════════════════════════════════
+# CROSS-MARKET RELATIONSHIPS
+# ════════════════════════════════════════════════════════════════════════
+
+CROSS_MARKET_PAIRS: List[
+    Tuple[str, str, str, str, str]
+] = [
+
+    (
+        "football",
+        "double_chance",
+        "home_or_draw",
+        "winner",
+        "away",
+    ),
+
+    (
+        "football",
+        "double_chance",
+        "draw_or_away",
+        "winner",
+        "home",
+    ),
+
+    (
+        "football",
+        "double_chance",
+        "home_or_away",
+        "winner",
+        "draw",
+    ),
+
+    (
+        "football",
+        "both_to_score",
+        "yes",
+        "both_to_score",
+        "no",
+    ),
 ]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PUBLIC API
-# ═══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+# PUBLIC API
+# ════════════════════════════════════════════════════════════════════════
 
-def get_market_def(sport: str, market_key: str) -> Optional[MarketDef]:
-    """Return the MarketDef for a given sport and standardised market key."""
-    for m in ALL_MARKETS.get(sport, []):
-        if m.market_key == market_key:
-            return m
-    return None
+def get_market_def(
+    sport: str,
+    market_key: str,
+) -> Optional[MarketDef]:
 
-
-def get_settlement_speed(sport: str, market_key: str) -> int:
-    """Return the settlement speed constant for a market (default SLOW)."""
-    m = get_market_def(sport, market_key)
-    return m.settlement_speed if m else SLOW
+    return _MARKET_CACHE.get((sport, market_key))
 
 
-def get_speed_score(sport: str, market_key: str) -> float:
+def get_settlement_speed(
+    sport: str,
+    market_key: str,
+) -> int:
+
+    market = get_market_def(sport, market_key)
+
+    if not market:
+        return SLOW
+
+    return market.settlement_speed
+
+
+def get_speed_score(
+    sport: str,
+    market_key: str,
+) -> float:
+
     speed = get_settlement_speed(sport, market_key)
+
     return SPEED_SCORES.get(speed, 0.1)
 
 
-def get_stability_score(is_live: bool, minutes_to_kickoff: float = 0) -> float:
-    """
-    Return stability score based on match state.
-    - Pre‑match, 10‑30 min to kickoff → HIGH
-    - Pre‑match, 30‑60 min → MEDIUM
-    - Live, early (first quarter / 1st half / first set) → MEDIUM
-    - Live, late → LOW
-    """
-    if not is_live:
-        if 10 <= minutes_to_kickoff <= 30:
-            return STABILITY_HIGH
-        elif 30 < minutes_to_kickoff <= 60:
-            return STABILITY_MEDIUM
-        else:
-            return STABILITY_LOW   # >60 min out = low urgency
-    else:
-        # For live matches we'll assume the caller passes an appropriate flag;
-        # here we return MEDIUM as a safe default for early live.
-        # The caller should use the more specific is_early_live / is_late_live
-        # from the match context.
+def get_stability_score(
+    is_live: bool,
+    minutes_to_kickoff: float = 0,
+) -> float:
+
+    if is_live:
         return STABILITY_MEDIUM
+
+    if 10 <= minutes_to_kickoff <= 30:
+        return STABILITY_HIGH
+
+    if 30 < minutes_to_kickoff <= 60:
+        return STABILITY_MEDIUM
+
+    return STABILITY_LOW
 
 
 def find_cross_market_opposite(
     sport: str,
     market_a: str,
-    outcome_a: str
+    outcome_a: str,
 ) -> Optional[Tuple[str, str]]:
-    """
-    Given a market and the side you would bet on Platform A,
-    return the (market_key, outcome) that is its logical opposite on Platform B.
-    """
-    for s, mk_a, out_a, mk_b, out_b in CROSS_MARKET_PAIRS:
-        if s == sport and mk_a == market_a and out_a == outcome_a.lower():
+
+    for (
+        s,
+        mk_a,
+        out_a,
+        mk_b,
+        out_b,
+    ) in CROSS_MARKET_PAIRS:
+
+        if (
+            s == sport
+            and mk_a == market_a
+            and out_a == outcome_a.lower()
+        ):
             return (mk_b, out_b)
+
     return None
 
 
@@ -221,20 +467,28 @@ def calculate_priority_score(
     minutes_to_kickoff: float = 0,
     is_early_live: bool = False,
 ) -> Tuple[float, dict]:
-    """
-    Calculate the three‑factor priority score for an arb.
 
-    Returns (score, breakdown_dict)
-    """
-    speed = get_speed_score(sport, market_key)
+    speed = get_speed_score(
+        sport,
+        market_key,
+    )
 
     if is_live:
-        stability = STABILITY_MEDIUM if is_early_live else STABILITY_LOW
+        stability = (
+            STABILITY_MEDIUM
+            if is_early_live
+            else STABILITY_LOW
+        )
     else:
-        stability = get_stability_score(is_live, minutes_to_kickoff)
+        stability = get_stability_score(
+            is_live,
+            minutes_to_kickoff,
+        )
 
-    # Normalise margin to 0‑100 scale for scoring (cap at 10 %)
-    margin_score = min(margin_pct / 10.0, 1.0)
+    margin_score = min(
+        margin_pct / 10.0,
+        1.0,
+    )
 
     score = (
         (margin_score * WEIGHT_MARGIN)
@@ -243,10 +497,10 @@ def calculate_priority_score(
     )
 
     breakdown = {
-        "margin_pct": margin_pct,
+        "margin_pct": round(margin_pct, 3),
         "margin_score": round(margin_score, 3),
-        "speed": speed,
-        "stability": stability,
+        "speed": round(speed, 3),
+        "stability": round(stability, 3),
         "final_score": round(score, 3),
     }
 
