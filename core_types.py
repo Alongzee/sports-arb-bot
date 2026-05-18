@@ -12,13 +12,6 @@ class Sport(str, Enum):
     TABLE_TENNIS = "table_tennis"
 
 
-class MarketCategory(str, Enum):
-    MONEYLINE = "moneyline"
-    TOTAL = "total"
-    SPREAD = "spread"
-    PROP = "prop"
-    COMBO = "combo"
-
 
 class OutcomeType(str, Enum):
     HOME = "home"
