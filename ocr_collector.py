@@ -852,45 +852,268 @@ class OddsParser:
                 or (
                     all_lines[idx - 1].strip()
                     if idx > 0 else ""
+class OddsParser:
+    """
+    OCR text -> normalized tier 1 betting observations.
+
+    Tier 1 supported:
+      - moneyline
+      - totals
+      - spread / handicap
+      - both teams to score
+
+    Works across:
+      - football
+      - basketball
+      - tennis
+      - table tennis
+    """
+
+    MONEYLINE_KEYWORDS = [
+        "1x2",
+        "moneyline",
+        "match result",
+        "match winner",
+        "winner",
+    ]
+
+    SPREAD_KEYWORDS = [
+        "handicap",
+        "asian handicap",
+        "spread",
+        "ah",
+    ]
+
+    BTTS_KEYWORDS = [
+        "btts",
+        "both teams to score",
+        "gg/ng",
+        "bts",
+    ]
+
+    SELECTION_MAP = {
+        "1": "home",
+        "2": "away",
+        "x": "draw",
+
+        "home": "home",
+        "away": "away",
+        "draw": "draw",
+
+        "over": "over",
+        "under": "under",
+
+        "o": "over",
+        "u": "under",
+
+        "yes": "yes",
+        "no": "no",
+    }
+
+    def parse(
+        self,
+        raw_lines: List[Tuple[str, float]],
+        match: str,
+        is_live: bool,
+    ) -> List[OddsEntry]:
+
+        now = datetime.now(timezone.utc)
+
+        ts = now.isoformat()
+        unix_now = now.timestamp()
+
+        texts = [t for t, _ in raw_lines]
+        confs = [c for _, c in raw_lines]
+
+        entries = []
+
+        current_market = "unknown"
+
+        for idx, line in enumerate(texts):
+
+            conf = confs[idx]
+
+            clean = line.strip()
+
+            if len(clean) < 2:
+                continue
+
+            market = self._detect_market(clean)
+
+            if market:
+                current_market = market
+
+            odds_val, selection, parse_conf = self._parse_odds(
+                clean,
+                texts,
+                idx,
+            )
+
+            if odds_val is None:
+                continue
+
+            if not (MIN_ODDS <= odds_val <= MAX_ODDS):
+                continue
+
+            combined_conf = min(conf, parse_conf)
+
+            if combined_conf < MIN_CONFIDENCE:
+                continue
+
+            normalized_selection = self._normalize_selection(selection)
+
+            entries.append(
+                OddsEntry(
+                    bookmaker="bet105",
+                    match=match,
+                    market=current_market,
+                    selection=normalized_selection,
+                    odds=odds_val,
+                    timestamp=ts,
+                    unix_ts=unix_now,
+                    is_live=is_live,
+                    confidence=combined_conf,
+                    raw_text=clean,
                 )
             )
 
-            return val, sel, 0.82
+        return self._deduplicate(entries)
+
+    def _detect_market(self, line: str) -> Optional[str]:
+
+        ll = line.lower()
+
+        # ── TOTALS ─────────────────────
+
+        total_match = re.search(
+            r"(over|under|o|u)\s*([0-9]+(?:\.[0-9]+)?)",
+            ll,
+        )
+
+        if total_match:
+
+            side = total_match.group(1)
+            line_value = total_match.group(2)
+
+            side = "over" if side in ["o", "over"] else "under"
+
+            return f"total_{line_value}"
+
+        # ── SPREADS / HANDICAPS ───────
+
+        if any(k in ll for k in self.SPREAD_KEYWORDS):
+
+            spread_match = re.search(
+                r"([+-]?[0-9]+(?:\.[0-9]+)?)",
+                ll,
+            )
+
+            if spread_match:
+                handicap = spread_match.group(1)
+                return f"spread_{handicap}"
+
+            return "spread"
+
+        # ── BTTS ──────────────────────
+
+        if any(k in ll for k in self.BTTS_KEYWORDS):
+            return "btts"
+
+        # ── MONEYLINE ─────────────────
+
+        if any(k in ll for k in self.MONEYLINE_KEYWORDS):
+            return "moneyline"
+
+        return None
+
+    def _parse_odds(
+        self,
+        line: str,
+        all_lines: List[str],
+        idx: int,
+    ):
+
+        # ── Decimal Odds ──────────────
+
+        dec = re.search(
+            r"\b([1-9][0-9]?\.[0-9]{1,3})\b",
+            line,
+        )
+
+        if dec:
+
+            odds = float(dec.group(1))
+
+            selection = (
+                line[:dec.start()].strip()
+                or (
+                    all_lines[idx - 1].strip()
+                    if idx > 0 else ""
+                )
+            )
+
+            return odds, selection, 0.92
+
+        # ── American Odds ─────────────
+
+        am = re.search(
+            r"([+-]\d{3,4})",
+            line,
+        )
+
+        if am:
+
+            american = int(am.group(1))
+
+            if american > 0:
+                odds = round((american / 100) + 1, 3)
+            else:
+                odds = round((100 / abs(american)) + 1, 3)
+
+            selection = (
+                line[:am.start()].strip()
+                or (
+                    all_lines[idx - 1].strip()
+                    if idx > 0 else ""
+                )
+            )
+
+            return odds, selection, 0.82
 
         return None, None, 0.0
 
-    def _normalize(self, s: str) -> str:
+    def _normalize_selection(self, selection: str) -> str:
 
-        sl = s.lower().strip()
+        s = selection.lower().strip()
 
         return self.SELECTION_MAP.get(
-            sl,
-            s.strip() or "unknown"
+            s,
+            selection.strip() or "unknown",
         )
 
     def _deduplicate(
         self,
-        entries: List[OddsEntry]
+        entries: List[OddsEntry],
     ) -> List[OddsEntry]:
 
-        seen = {}
+        best = {}
 
         for e in entries:
 
-            k = (
+            key = (
                 f"{e.match}|"
                 f"{e.market}|"
                 f"{e.selection}"
             )
 
-            if (
-                k not in seen
-                or e.confidence > seen[k].confidence
-            ):
-                seen[k] = e
+            if key not in best:
+                best[key] = e
+                continue
 
-        return list(seen.values())
+            if e.confidence > best[key].confidence:
+                best[key] = e
 
+        return list(best.values())
 
 # ── VPS SENDER ────────────────────────────────────────────────────────────
 
