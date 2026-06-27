@@ -1,6 +1,6 @@
 """
-arb_engine.py – Arbitrage math engine with three‑factor priority scoring,
-                same‑match bonus detection, and golden arb override.
+arb_engine.py – Arbitrage math engine with N-way support.
+Finds best-odds pairs across any number of bookmakers (2-way, 3-way, etc).
 """
 
 from __future__ import annotations
@@ -24,8 +24,7 @@ from config import (
     GOLDEN_ARB_MAX_PER_DAY,
     DUPLICATE_WINDOW,
     COOL_OFF_DAYS,
-    BOOKMAKER_YOU,
-    BOOKMAKER_FRIEND,
+    BOOKMAKERS,
 )
 
 log = logging.getLogger("arb_engine")
@@ -40,12 +39,7 @@ class ArbOpportunity:
     sport: str
     market_display: str
     market_key: str
-    platform_over: str           # which platform has the best Over / Home / Yes
-    platform_under: str          # which platform has the best Under / Away / No
-    odds_over: float
-    odds_under: float
-    stake_over: float
-    stake_under: float
+    sides: Dict[str, Tuple[str, float]]  # side → (platform, odds)  e.g. {"over": ("sportybet", 1.92), "under": ("betway", 2.05)}
     margin_pct: float
     priority_score: float
     speed: int
@@ -54,7 +48,7 @@ class ArbOpportunity:
     minutes_to_kickoff: float
     is_golden_override: bool = False
     score_breakdown: dict = field(default_factory=dict)
-    same_match_bonus: bool = False
+    num_platforms: int = 2  # 2-way, 3-way, etc
 
 
 @dataclass
@@ -67,15 +61,15 @@ class ArbResult:
 
 class ArbEngine:
     """
-    Evaluates every two‑way market pair and cross‑market pair,
-    ranks arbs, and returns the single best opportunity per scan cycle.
+    Evaluates N-way markets and ranks arbs.
+    Returns the single best opportunity per scan cycle.
     """
 
     def __init__(self, balancer: Balancer) -> None:
         self.balancer = balancer
         self._callbacks: List[Callable] = []
         self._next_id = 1
-        self._last_alerted: Dict[str, float] = {}   # market_key → timestamp
+        self._last_alerted: Dict[str, float] = {}
         self._golden_arbs_today = 0
         self._golden_reset_day = -1
 
@@ -111,39 +105,56 @@ class ArbEngine:
             and speed in (ULTRA_FAST, FAST)
         )
 
-    # ── Core evaluation ────────────────────────────────────────────────
-    def evaluate(
+    # ── N-way arbitrage evaluation ─────────────────────────────────────
+    def evaluate_nway(
         self,
         sport: str,
         match_name: str,
         market_key: str,
-        odds_a: Tuple[str, float],   # (platform, odds) for side A
-        odds_b: Tuple[str, float],   # (platform, odds) for side B
+        sides_odds: Dict[str, List[Tuple[str, float]]],
         is_live: bool,
         minutes_to_kickoff: float,
         market_display: str = "",
     ) -> Optional[ArbOpportunity]:
         """
-        Calculate whether an arb exists and score it.
-        odds_a and odds_b must be from DIFFERENT platforms.
+        Evaluate N-way arbitrage for a single market.
+        
+        sides_odds format:
+        {
+            "over": [("sportybet", 1.72), ("betway", 1.88), ...],
+            "under": [("1win", 2.01), ("betway", 1.95), ...],
+        }
+        
+        Picks the single best odds for each side and checks if arb exists.
         """
-        plat_a, odd_a = odds_a
-        plat_b, odd_b = odds_b
+        
+        # Pick best odds per side
+        best_sides = {}
+        for side, bookies in sides_odds.items():
+            if not bookies:
+                return None
+            # Sort by odds descending, pick the best (highest)
+            best_platform, best_odds = max(bookies, key=lambda x: x[1])
+            best_sides[side] = (best_platform, best_odds)
 
-        if plat_a == plat_b:
-            return None  # same platform = no arb
+        # Need at least 2 sides for an arb
+        if len(best_sides) < 2:
+            return None
 
-        # Implied probability
-        imp_a = 1.0 / odd_a
-        imp_b = 1.0 / odd_b
-        combined = imp_a + imp_b
+        # Check if sides are from DIFFERENT platforms (basic arb requirement)
+        platforms = {p for p, _ in best_sides.values()}
+        if len(platforms) < 2:
+            return None  # all sides from same platform = no arb
 
-        if combined >= 1.0:
+        # Calculate implied probability
+        implied = sum(1.0 / odds for _, odds in best_sides.values())
+        
+        if implied >= 1.0:
             return None  # no arb
 
-        margin_pct = (1.0 - combined) * 100
+        margin_pct = (1.0 - implied) * 100
 
-        # ── Minimum margin (flexible, from balancer) ─────────────────
+        # ── Minimum margin check ────────────────────────────────────
         min_margin = self.balancer.get_min_margin()
         is_cool = self._is_cool_off()
 
@@ -157,26 +168,30 @@ class ArbEngine:
             if margin_pct < min_margin:
                 return None
 
-        # ── Priority scoring ─────────────────────────────────────────
+        # ── Priority scoring ────────────────────────────────────────
         speed = self._get_speed(sport, market_key)
         stability = get_stability_score(is_live, minutes_to_kickoff)
         score, breakdown = calculate_priority_score(
             margin_pct, sport, market_key, is_live, minutes_to_kickoff,
         )
 
-        # ── Rebalance bonus ──────────────────────────────────────────
+        # ── Rebalance bonus ────────────────────────────────────────
         rebalance_bonus = self.balancer.get_rebalance_bonus()
         final_score = score * rebalance_bonus
 
-        # ── Stakes ───────────────────────────────────────────────────
-        stake_over, stake_under = self.balancer.calculate_balanced_stakes(
-            odd_a, odd_b,
+        # ── Stakes (calculate for just the first 2 sides, order doesn't matter) ──
+        sides_list = list(best_sides.items())
+        _, (_, odds_a) = sides_list[0]
+        _, (_, odds_b) = sides_list[1]
+        
+        stake_a, stake_b = self.balancer.calculate_balanced_stakes(
+            odds_a, odds_b,
             self.balancer.get_total_available(),
         )
 
         # ── Viability ────────────────────────────────────────────────
         viable, reason = self.balancer.can_execute(
-            stake_over, stake_under, min_margin, margin_pct,
+            stake_a, stake_b, min_margin, margin_pct,
         )
         if not viable:
             log.info(f"Arb skipped: {reason}")
@@ -188,12 +203,7 @@ class ArbEngine:
             sport=sport,
             market_display=market_display or market_key,
             market_key=market_key,
-            platform_over=plat_a,
-            platform_under=plat_b,
-            odds_over=odd_a,
-            odds_under=odd_b,
-            stake_over=stake_over,
-            stake_under=stake_under,
+            sides=best_sides,
             margin_pct=margin_pct,
             priority_score=final_score,
             speed=speed,
@@ -202,6 +212,7 @@ class ArbEngine:
             minutes_to_kickoff=minutes_to_kickoff,
             is_golden_override=golden,
             score_breakdown=breakdown,
+            num_platforms=len(platforms),
         )
 
     # ── Batch scan ─────────────────────────────────────────────────────
@@ -209,43 +220,32 @@ class ArbEngine:
         self,
         sport: str,
         match_name: str,
-        markets: Dict[str, Dict[str, Tuple[str, float]]],
+        markets: Dict[str, Dict[str, List[Tuple[str, float]]]],
         is_live: bool,
         minutes_to_kickoff: float,
     ) -> ArbResult:
         """
+        Scan all markets for a match and return the single best arb.
+        
         markets format:
         {
             "over_under_2.5": {
-                "over":  ("sportybet", 1.72),
-                "under": ("1win", 2.01),
+                "over": [("sportybet", 1.72), ("betway", 1.88)],
+                "under": [("1win", 2.01), ("betway", 1.95)],
             },
             ...
         }
-        Returns the single best arb for this match, or an empty result.
         """
         candidates: List[ArbOpportunity] = []
 
-        for market_key, sides in markets.items():
-            if "over" in sides and "under" in sides:
-                side_a = sides["over"]
-                side_b = sides["under"]
-            elif "home" in sides and "away" in sides:
-                side_a = sides["home"]
-                side_b = sides["away"]
-            else:
-                continue
-
-            if not side_a or not side_b:
-                continue
-
+        for market_key, sides_odds in markets.items():
             # Skip duplicates
             if self._is_duplicate(match_name, market_key):
                 continue
 
-            arb = self.evaluate(
+            arb = self.evaluate_nway(
                 sport, match_name, market_key,
-                side_a, side_b,
+                sides_odds,
                 is_live, minutes_to_kickoff,
             )
             if arb:
@@ -265,7 +265,7 @@ class ArbEngine:
 
         return ArbResult(opportunity=best)
 
-    # ── Helpers ──────────────────────────────────────────────────────────
+    # ── Helpers ────────────────────────────────────────────────────────
     def _get_speed(self, sport: str, market_key: str) -> int:
         from market_ai import get_settlement_speed
-        return get_settlement_speed(sport, market_key) 
+        return get_settlement_speed(sport, market_key)
