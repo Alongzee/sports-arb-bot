@@ -9,19 +9,23 @@ from typing import List
 
 # ── Telegram ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")   # Group ID for alerts
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")   # Your chat ID for all alerts
 
-# ── Bookmakers ────────────────────────────────────────────────────────────
-BOOKMAKER_YOU    = "1win"
-BOOKMAKER_FRIEND = "sportybet"
+# ── Bookmakers – dynamic list for N-way arbitrage ──────────────────────────
+# Add/remove bookmakers here. All arbs alert to you. You distribute manually.
+BOOKMAKERS = [
+    "sportybet",
+    "1win",
+    "betway",
+]
 
 # ── Active Hours (UTC) ────────────────────────────────────────────────────
 ACTIVE_START   = 0    # 6 AM
 ACTIVE_END     = 24   # 6 PM
 
 # ── Bankroll & Staking ────────────────────────────────────────────────────
-TOTAL_BANKROLL = 100.0          # GHS – split across both accounts
-ACCOUNT_FLOOR  = 5.0            # Minimum balance an account can hold before arb is skipped
+TOTAL_BANKROLL = 100.0          # GHS – total pool across all accounts
+ACCOUNT_FLOOR  = 5.0            # Minimum balance any account can hold before arb is skipped
 
 # ── Non‑Arb Bets ──────────────────────────────────────────────────────────
 NON_ARB_BASE_PCT    = 1.0      # base percentage of current balance
@@ -82,3 +86,8 @@ PASSIVE_MODE_END   = 6    # 6 AM UTC
 
 # ── Scan Interval ─────────────────────────────────────────────────────────
 SCAN_INTERVAL = 2  # seconds between full scan cycles
+
+# ── Discovery Settings ────────────────────────────────────────────────────
+DISCOVERY_REFRESH_INTERVAL = 3600  # 1 hour – how often to fetch full match lists from bookmakers
+DISCOVERY_KICKOFF_PROXIMITY = 180  # 3 minutes – matches within this time are considered the same
+
