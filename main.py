@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from scraper import get_scraper, SportyBetScraper, OneWinScraper, BetwayScraper
+from scraper import get_scraper, SportyBetScraper, BetwayScraper
 from discovery import fetch_all_bookmaker_events, cluster_matches
 from matcher import match_teams
 from arb_engine import ArbEngine, ArbOpportunity
