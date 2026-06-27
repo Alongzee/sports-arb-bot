@@ -1,248 +1,255 @@
 """
-balancer.py – Dual‑account bankroll tracker, capital lock, stake rounding,
-              hedge correction, and flexible minimum margin.
+balancer.py – Multi-bookmaker bankroll tracker for N-way arbitrage.
+
+Tracks balance per bookmaker, calculates balanced stakes for any N-way arb,
+manages capital lock, and enforces minimum account floors.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+import logging
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 from config import (
-    ACCOUNT_FLOOR,
     TOTAL_BANKROLL,
-    BOOKMAKER_YOU,
-    BOOKMAKER_FRIEND,
+    ACCOUNT_FLOOR,
+    BOOKMAKERS,
 )
-from market_ai import ULTRA_FAST, FAST, MEDIUM, SLOW, get_settlement_speed
+from market_ai import ULTRA_FAST, FAST, MEDIUM, SLOW
+
+log = logging.getLogger("balancer")
 
 
 # ── Data structures ───────────────────────────────────────────────────────
 
 @dataclass
 class Account:
+    """Single bookmaker account."""
     platform: str
-    balance: float = 0.0
-    locked: float = 0.0          # capital currently in active arbs
+    balance: float = 0.0        # current balance
+    locked: float = 0.0          # capital in active arbs
 
     @property
     def available(self) -> float:
+        """Usable balance (balance - locked)."""
         return max(0.0, self.balance - self.locked)
 
 
-@dataclass
-class ActiveArb:
-    arb_id: int
-    sport: str
-    market_key: str
-    stake_you: float
-    stake_friend: float
-    locked: bool = True           # True until settled
-    settlement_speed: int = FAST
-
-
-# ── Balancer engine ───────────────────────────────────────────────────────
+# ── Balancer ───────────────────────────────────────────────────────────────
 
 class Balancer:
     """
-    Tracks two accounts, manages locked capital, and provides
-    stake‑rounding with automatic hedge correction.
+    Manages multi-bookmaker accounts for N-way arbitrage.
+    
+    - Tracks balance per platform
+    - Calculates balanced stakes for any two platforms
+    - Enforces account floors
+    - Manages capital lock for active arbs
     """
 
-    def __init__(self) -> None:
-        self.accounts: Dict[str, Account] = {
-            BOOKMAKER_YOU:    Account(BOOKMAKER_YOU,    TOTAL_BANKROLL / 2),
-            BOOKMAKER_FRIEND: Account(BOOKMAKER_FRIEND, TOTAL_BANKROLL / 2),
-        }
-        self.active_arbs: Dict[int, ActiveArb] = {}
-        self._next_arb_id = 1
+    def __init__(self):
+        self.accounts: Dict[str, Account] = {}
+        
+        # Initialize accounts for all bookmakers
+        per_bookie = TOTAL_BANKROLL / len(BOOKMAKERS) if BOOKMAKERS else 0
+        for bookie in BOOKMAKERS:
+            self.accounts[bookie] = Account(platform=bookie, balance=per_bookie)
+        
+        log.info(f"Balancer initialized: {len(BOOKMAKERS)} bookmakers, GHS {TOTAL_BANKROLL} bankroll")
 
-    # ── Balance sync ──────────────────────────────────────────────────
+    # ── Balance queries ────────────────────────────────────────────────────
+    def get_balance(self, platform: str = "all") -> float:
+        """Get balance for one platform or all combined."""
+        if platform == "all":
+            return sum(acc.balance for acc in self.accounts.values())
+        return self.accounts.get(platform, Account(platform)).balance
 
-    def set_balances(self, you: float, friend: float) -> None:
-        """Manual override – call from /balance command."""
-        self.accounts[BOOKMAKER_YOU].balance = you
-        self.accounts[BOOKMAKER_FRIEND].balance = friend
-
-    def get_available(self, platform: str) -> float:
-        return self.accounts[platform].available
-
-    def get_balance(self, platform: str) -> float:
-        return self.accounts[platform].balance
+    def get_available(self, platform: str = "all") -> float:
+        """Get available (unlocked) balance."""
+        if platform == "all":
+            return sum(acc.available for acc in self.accounts.values())
+        return self.accounts.get(platform, Account(platform)).available
 
     def get_total_available(self) -> float:
-        return sum(a.available for a in self.accounts.values())
-
-    # ── Flexible minimum margin ────────────────────────────────────────
+        """Total available balance across all accounts."""
+        return self.get_available("all")
 
     def get_min_margin(self) -> float:
-        """
-        Returns the minimum margin that should be required right now.
-        Drops from 1.5 % → 1.2 % → 0.8 % as imbalance grows.
-        """
-        bal_you = self.accounts[BOOKMAKER_YOU].balance
-        bal_friend = self.accounts[BOOKMAKER_FRIEND].balance
-        total = bal_you + bal_friend
-        if total == 0:
-            return 1.5
-
-        pct_you = (bal_you / total) * 100
-        imbalance = abs(pct_you - 50)
-
-        if imbalance < 10:        # 40‑60 % → balanced
-            return 1.5
-        elif imbalance < 20:      # 30‑70 % → moderate
-            return 1.2
-        else:                     # >70 % → severe
-            return 0.8
-
-    # ── Arb viability check ────────────────────────────────────────────
-
-    def can_execute(
-        self,
-        stake_you: float,
-        stake_friend: float,
-        min_margin: float = 1.5,
-        margin_pct: float = 0.0,
-    ) -> Tuple[bool, str]:
-        """
-        Returns (True, "") if both accounts have enough available funds
-        AND the arb meets the current minimum margin.
-        """
-        if margin_pct < min_margin:
-            return False, f"Margin {margin_pct:.1f} % < min {min_margin:.1f} %"
-
-        if stake_you > self.accounts[BOOKMAKER_YOU].available:
-            return False, f"Insufficient funds on {BOOKMAKER_YOU}"
-        if stake_friend > self.accounts[BOOKMAKER_FRIEND].available:
-            return False, f"Insufficient funds on {BOOKMAKER_FRIEND}"
-
-        # Ensure neither account drops below floor after stake
-        if (self.accounts[BOOKMAKER_YOU].balance - stake_you) < ACCOUNT_FLOOR:
-            return False, f"{BOOKMAKER_YOU} would drop below floor"
-        if (self.accounts[BOOKMAKER_FRIEND].balance - stake_friend) < ACCOUNT_FLOOR:
-            return False, f"{BOOKMAKER_FRIEND} would drop below floor"
-
-        return True, ""
-
-    # ── Stake rounding with hedge correction ───────────────────────────
-
-    @staticmethod
-    def round_stake(amount: float) -> float:
-        """
-        Round stake according to our security rules.
-        <10   → nearest 0.50
-        10‑50 → nearest 1.00
-        >50   → nearest 5.00
-        """
-        if amount < 10:
-            return round(amount * 2) / 2    # nearest 0.50
-        elif amount < 50:
-            return round(amount)             # nearest 1
-        else:
-            return round(amount / 5) * 5     # nearest 5
-
-    def calculate_balanced_stakes(
-        self,
-        odds_you: float,
-        odds_friend: float,
-        total_capital: float | None = None,
-    ) -> Tuple[float, float]:
-        """
-        Given two odds, compute exact stakes, round the first one,
-        then recalculate the second stake so the hedge remains intact.
-        Returns (rounded_stake_you, corrected_stake_friend).
-        """
-        if total_capital is None:
-            total_capital = self.get_total_available()
-
-        # Implied probabilities
-        imp_you = 1.0 / odds_you
-        imp_friend = 1.0 / odds_friend
-        total_imp = imp_you + imp_friend
-
-        # Exact stakes
-        exact_you = total_capital * (imp_you / total_imp)
-        exact_friend = total_capital * (imp_friend / total_imp)
-
-        # Round your stake, correct friend's
-        rounded_you = self.round_stake(exact_you)
-        # Recalculate friend's stake to maintain the same payout ratio
-        corrected_friend = rounded_you * (odds_you / odds_friend)
-        # Round friend's stake
-        rounded_friend = self.round_stake(corrected_friend)
-
-        return rounded_you, rounded_friend
-
-    # ── Capital lock / release ─────────────────────────────────────────
-
-    def lock_capital(
-        self,
-        sport: str,
-        market_key: str,
-        stake_you: float,
-        stake_friend: float,
-    ) -> int:
-        """Lock capital for a new arb; returns arb_id."""
-        arb_id = self._next_arb_id
-        self._next_arb_id += 1
-
-        speed = get_settlement_speed(sport, market_key)
-        self.active_arbs[arb_id] = ActiveArb(
-            arb_id=arb_id,
-            sport=sport,
-            market_key=market_key,
-            stake_you=stake_you,
-            stake_friend=stake_friend,
-            settlement_speed=speed,
-        )
-
-        self.accounts[BOOKMAKER_YOU].locked += stake_you
-        self.accounts[BOOKMAKER_FRIEND].locked += stake_friend
-        return arb_id
-
-    def release_capital(self, arb_id: int, winner: str) -> None:
-        """
-        Release capital after settlement.
-        winner = 'you' | 'friend' (which platform won)
-        """
-        arb = self.active_arbs.pop(arb_id, None)
-        if arb is None:
-            return
-
-        self.accounts[BOOKMAKER_YOU].locked -= arb.stake_you
-        self.accounts[BOOKMAKER_FRIEND].locked -= arb.stake_friend
-
-        # Payout: the winning side gets the total profit added
-        payout_you = arb.stake_you * (1 + arb.stake_friend / arb.stake_you)  # approx
-        # Simpler: just add the profit to the winner, remove stake from loser
-        if winner == "you":
-            self.accounts[BOOKMAKER_YOU].balance += arb.stake_friend  # profit
-        else:
-            self.accounts[BOOKMAKER_FRIEND].balance += arb.stake_you
-
-    def get_locked_arbs(self) -> List[ActiveArb]:
-        return list(self.active_arbs.values())
-
-    # ── Rebalance priority ─────────────────────────────────────────────
+        """Minimum margin % required for an arb to be placed."""
+        # Could be dynamic based on account balances, but static for now
+        from config import MIN_MARGIN_PCT
+        return MIN_MARGIN_PCT
 
     def get_rebalance_bonus(self) -> float:
-        """
-        Returns a multiplier (1.0‑1.5) that boosts arbs favouring
-        the weaker account. Used by arb engine when ranking opportunities.
-        """
-        bal_you = self.accounts[BOOKMAKER_YOU].balance
-        bal_friend = self.accounts[BOOKMAKER_FRIEND].balance
-        total = bal_you + bal_friend
-        if total == 0:
+        """Bonus multiplier if accounts are imbalanced (encourages rebalancing)."""
+        if not self.accounts:
             return 1.0
+        
+        balances = [acc.balance for acc in self.accounts.values()]
+        avg_balance = sum(balances) / len(balances)
+        
+        # If any account is far below average, boost priority on arbs that favor it
+        min_bal = min(balances)
+        if min_bal < avg_balance * 0.7:
+            return 1.2  # 20% priority boost
+        return 1.0
 
-        pct_you = (bal_you / total) * 100
-        imbalance = abs(pct_you - 50)
+    # ── Stake calculation ──────────────────────────────────────────────────
+    def calculate_balanced_stakes(
+        self,
+        odds_a: float,
+        odds_b: float,
+        total_stake: float,
+    ) -> Tuple[float, float]:
+        """
+        Calculate balanced stakes for a 2-way arb.
+        
+        If there's 100 GHS and odds are 1.8 vs 2.0:
+        - stake_a should win 100 GHS
+        - stake_b should also win 100 GHS
+        
+        Returns: (stake_a, stake_b)
+        """
+        if odds_a <= 1.0 or odds_b <= 1.0 or total_stake <= 0:
+            return 0.0, 0.0
+        
+        # Target win = total_stake / 2 (both sides win equally)
+        target_win = total_stake / 2.0
+        
+        stake_a = target_win / (odds_a - 1.0)
+        stake_b = target_win / (odds_b - 1.0)
+        
+        # Round to 0.5 GHS increments
+        from config import NON_ARB_ROUND_TO
+        stake_a = round(stake_a / NON_ARB_ROUND_TO) * NON_ARB_ROUND_TO
+        stake_b = round(stake_b / NON_ARB_ROUND_TO) * NON_ARB_ROUND_TO
+        
+        return stake_a, stake_b
 
-        if imbalance < 15:
-            return 1.0
-        elif imbalance < 30:
-            return 1.2
-        else:
-            return 1.5
+    # ── Execution validation ───────────────────────────────────────────────
+    def can_execute(
+        self,
+        stake_a: float,
+        stake_b: float,
+        min_margin: float,
+        actual_margin: float,
+    ) -> Tuple[bool, str]:
+        """
+        Check if an arb can be placed given current balances.
+        
+        Returns: (can_place, reason_if_not)
+        """
+        # Margin check
+        if actual_margin < min_margin:
+            return False, f"Margin {actual_margin:.2f}% below minimum {min_margin:.2f}%"
+        
+        # We don't know which platforms yet (that's in ArbEngine),
+        # so we just check if there's enough total available
+        total_needed = stake_a + stake_b
+        total_available = self.get_total_available()
+        
+        if total_needed > total_available:
+            return False, f"Need GHS {total_needed:.2f}, only GHS {total_available:.2f} available"
+        
+        # Rough floor check (more detailed check happens in lock_arb)
+        if total_available - total_needed < ACCOUNT_FLOOR * len(self.accounts):
+            return False, "Would violate account floors"
+        
+        return True, ""
+
+    # ── Capital management ─────────────────────────────────────────────────
+    def lock_arb(
+        self,
+        platform_a: str,
+        stake_a: float,
+        platform_b: str,
+        stake_b: float,
+    ) -> bool:
+        """
+        Lock capital for an active arb.
+        Returns False if not enough balance on either platform.
+        """
+        acc_a = self.accounts.get(platform_a)
+        acc_b = self.accounts.get(platform_b)
+        
+        if not acc_a or not acc_b:
+            log.error(f"Platform not found: {platform_a} or {platform_b}")
+            return False
+        
+        if acc_a.available < stake_a:
+            log.error(f"{platform_a}: insufficient funds (need {stake_a}, have {acc_a.available})")
+            return False
+        
+        if acc_b.available < stake_b:
+            log.error(f"{platform_b}: insufficient funds (need {stake_b}, have {acc_b.available})")
+            return False
+        
+        if (acc_a.balance - stake_a) < ACCOUNT_FLOOR:
+            log.error(f"{platform_a}: would violate account floor")
+            return False
+        
+        if (acc_b.balance - stake_b) < ACCOUNT_FLOOR:
+            log.error(f"{platform_b}: would violate account floor")
+            return False
+        
+        acc_a.locked += stake_a
+        acc_b.locked += stake_b
+        log.info(f"Locked: {platform_a} GHS {stake_a:.2f}, {platform_b} GHS {stake_b:.2f}")
+        return True
+
+    def unlock_arb(self, platform_a: str, stake_a: float, platform_b: str, stake_b: float):
+        """Unlock capital (arb cancelled or result determined)."""
+        self.accounts[platform_a].locked -= stake_a
+        self.accounts[platform_b].locked -= stake_b
+        log.info(f"Unlocked: {platform_a} GHS {stake_a:.2f}, {platform_b} GHS {stake_b:.2f}")
+
+    def settle_arb_win(self, platform_a: str, stake_a: float, odds_a: float, platform_b: str, stake_b: float):
+        """
+        Settle a won arb.
+        Side A won: gets profit from stake_a * odds_a.
+        Side B lost: loses stake_b.
+        """
+        acc_a = self.accounts[platform_a]
+        acc_b = self.accounts[platform_b]
+        
+        # Unlock
+        acc_a.locked -= stake_a
+        acc_b.locked -= stake_b
+        
+        # Payout
+        profit_a = stake_a * (odds_a - 1.0)
+        acc_a.balance += profit_a
+        acc_b.balance -= stake_b
+        
+        log.info(f"Arb settled: {platform_a} +GHS {profit_a:.2f}, {platform_b} -GHS {stake_b:.2f}")
+
+    def settle_arb_loss(self, platform_a: str, stake_a: float, platform_b: str, stake_b: float, odds_b: float):
+        """
+        Settle when Side B wins instead.
+        Side B won: gets profit from stake_b * odds_b.
+        Side A lost: loses stake_a.
+        """
+        acc_a = self.accounts[platform_a]
+        acc_b = self.accounts[platform_b]
+        
+        # Unlock
+        acc_a.locked -= stake_a
+        acc_b.locked -= stake_b
+        
+        # Payout
+        profit_b = stake_b * (odds_b - 1.0)
+        acc_a.balance -= stake_a
+        acc_b.balance += profit_b
+        
+        log.info(f"Arb settled: {platform_a} -GHS {stake_a:.2f}, {platform_b} +GHS {profit_b:.2f}")
+
+    # ── Status ─────────────────────────────────────────────────────────────
+    def get_status(self) -> str:
+        """Return a formatted status string."""
+        lines = ["Balancer Status:", "─" * 40]
+        for bookie, acc in self.accounts.items():
+            lines.append(f"{bookie:15} Balance: GHS {acc.balance:8.2f}  Locked: GHS {acc.locked:8.2f}  Available: GHS {acc.available:8.2f}")
+        lines.append("─" * 40)
+        lines.append(f"{'TOTAL':15} Balance: GHS {self.get_balance():8.2f}  Locked: GHS {sum(a.locked for a in self.accounts.values()):8.2f}  Available: GHS {self.get_total_available():8.2f}")
+        return "\n".join(lines)
