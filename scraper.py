@@ -1,7 +1,7 @@
 """
 scraper.py – Odds scrapers for Tier 1 bookmakers.
 SportyBet uses direct API.
-Betway uses direct REST API discovery + pricing endpoints.
+Betway uses direct REST API discovery endpoint (unified: events + markets + outcomes + prices).
 """
 
 import asyncio
@@ -227,13 +227,12 @@ class BetwayScraper:
     """
     Betway REST API scraper.
     
-    Two-step process:
-    1. Discovery: GET /BetBook/Upcoming/ → list all upcoming events
-    2. Pricing: GET /MarketGroupings/MarketGroupNamesAndMarketsForEvent → odds per event
+    Single unified endpoint: GET /BetBook/Upcoming/
+    Returns all data in one response: events, markets, outcomes, prices
+    (linked by eventId, marketId, outcomeId)
     """
 
     DISCOVERY_BASE = "https://www.betway.com.gh/sportsapi/br/v1/BetBook/Upcoming/"
-    PRICING_BASE = "https://www.betway.com.gh/sportsapi/br/v1/MarketGroupings/MarketGroupNamesAndMarketsForEvent"
     
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
@@ -241,8 +240,8 @@ class BetwayScraper:
         "Referer": "https://www.betway.com.gh/",
     }
 
-    async def get_events(self, sport_id: str = "soccer", skip: int = 0, take: int = 20) -> list:
-        """Fetch list of upcoming events for a sport."""
+    async def get_events(self, sport_id: str = "soccer", skip: int = 0, take: int = 100) -> list:
+        """Fetch list of upcoming events for a sport with odds."""
         events = []
         try:
             params = {
@@ -253,119 +252,112 @@ class BetwayScraper:
                 "cultureCode": "en-US",
                 "isEsport": False,
                 "boostedOnly": False,
-                "marketTypes": "[Win/Draw/Win]",
+                "marketTypes": "[Win/Draw/Win]",  # Literal string, NOT array
             }
             async with httpx.AsyncClient(headers=self.HEADERS, timeout=10) as client:
                 r = await client.get(self.DISCOVERY_BASE, params=params)
                 r.raise_for_status()
                 data = r.json()
-                for e in data.get("events", []):
-                    events.append({
-                        "eventId": e.get("eventId"),
-                        "name": e.get("name", ""),
-                        "homeTeam": e.get("homeTeam", ""),
-                        "awayTeam": e.get("awayTeam", ""),
-                        "expectedStartEpoch": e.get("expectedStartEpoch", 0),
-                        "sport": sport_id,
-                    })
+                
+                # Build lookup tables: eventId/marketId/outcomeId → data
+                markets_by_event = {}
+                outcomes_by_market = {}
+                prices_by_outcome = {}
+                
+                for market in data.get("markets", []):
+                    markets_by_event[market["eventId"]] = market["marketId"]
+                
+                for outcome in data.get("outcomes", []):
+                    market_id = outcome["marketId"]
+                    if market_id not in outcomes_by_market:
+                        outcomes_by_market[market_id] = []
+                    outcomes_by_market[market_id].append(outcome)
+                
+                for price in data.get("prices", []):
+                    prices_by_outcome[price["outcomeId"]] = price["priceDecimal"]
+                
+                # Build event records with odds
+                for event in data.get("events", []):
+                    # Skip finished/inactive events
+                    if event.get("isFinished") or not event.get("isActive"):
+                        continue
+                    
+                    event_id = event["eventId"]
+                    market_id = markets_by_event.get(event_id)
+                    if not market_id:
+                        continue
+                    
+                    outcomes = outcomes_by_market.get(market_id, [])
+                    if len(outcomes) < 3:
+                        continue
+                    
+                    # Extract odds: map outcome names to prices
+                    home_team = event["homeTeam"]
+                    away_team = event["awayTeam"]
+                    
+                    home_odd = None
+                    draw_odd = None
+                    away_odd = None
+                    
+                    for outcome in outcomes:
+                        outcome_id = outcome["outcomeId"]
+                        price = prices_by_outcome.get(outcome_id)
+                        if not price:
+                            continue
+                        
+                        outcome_name = outcome["name"]
+                        if outcome_name == "Draw":
+                            draw_odd = price
+                        elif outcome_name == home_team:
+                            home_odd = price
+                        elif outcome_name == away_team:
+                            away_odd = price
+                    
+                    # Only add if all 3 odds present
+                    if home_odd and draw_odd and away_odd:
+                        events.append({
+                            "eventId": event_id,
+                            "name": event.get("name", f"{home_team} vs {away_team}"),
+                            "homeTeam": home_team,
+                            "awayTeam": away_team,
+                            "expectedStartEpoch": event.get("expectedStartEpoch", 0),
+                            "sport": sport_id,
+                            "odds": {
+                                "home": home_odd,
+                                "draw": draw_odd,
+                                "away": away_odd,
+                            }
+                        })
+                        
         except Exception as e:
             print(f"Betway discovery error: {e}")
+        
         return events
 
     async def get_odds(self, event_id) -> dict:
-        """Fetch odds for a specific event (accepts int or string)."""
+        """
+        Fetch odds for a specific event.
+        
+        Note: For efficiency, use get_events() which fetches all events + odds in one call.
+        This method exists for compatibility but re-fetches all events to get one.
+        """
         odds_data = {}
         try:
-            # Handle both int and string event IDs
-            event_id = int(event_id) if isinstance(event_id, str) else event_id
+            # Fetch all events (inefficient but maintains API compatibility)
+            events = await self.get_events()
             
-            params = {
-                "eventId": event_id,
-                "marketGroupId": " ",
-                "countryCode": "GH",
-                "cultureCode": "en-US",
-                "skip": 0,
-                "take": 20,
-                "isBuildABetOnly": False,
-                "searchQuery": "",
-            }
-            async with httpx.AsyncClient(headers=self.HEADERS, timeout=10) as client:
-                r = await client.get(self.PRICING_BASE, params=params)
-                r.raise_for_status()
-                data = r.json()
-                odds_data = self._parse_response(data)
-        except Exception as e:
-            print(f"Betway pricing error for event {event_id}: {e}")
-        return odds_data
-
-    def _parse_response(self, data: dict) -> dict:
-        """Parse Betway API response into normalized odds dict."""
-        odds_data = {}
-        try:
-            markets_in_group = data.get("marketsInGroup", [])
-            outcomes = data.get("outcomes", [])
-            prices = data.get("prices", [])
-
-            # Build a map: outcomeId → price
-            price_map = {}
-            for price in prices:
-                outcome_id = price.get("outcomeId")
-                odds = price.get("decimalOdds", price.get("odds"))
-                if outcome_id and odds:
-                    try:
-                        price_map[outcome_id] = float(odds)
-                    except (TypeError, ValueError):
-                        pass
-
-            # Parse markets and outcomes
-            for market in markets_in_group:
-                market_name = market.get("marketName", market.get("name", ""))
-                market_key = normalise_market(market_name)
-                
-                parsed_sides = {}
-                for outcome in outcomes:
-                    if outcome.get("marketId") != market.get("marketId"):
-                        continue
-                    outcome_id = outcome.get("outcomeId")
-                    outcome_name = outcome.get("outcomeName", outcome.get("name", "")).lower()
+            # Find the event by ID
+            for event in events:
+                if event["eventId"] == int(event_id) if isinstance(event_id, str) else event_id:
+                    if "odds" in event:
+                        # Convert to normalized format
+                        odds_data["1x2"] = event["odds"]
+                    break
                     
-                    if outcome_id not in price_map:
-                        continue
-                    odds = price_map[outcome_id]
-                    
-                    # Map outcome name to canonical side
-                    side = self._map_side(outcome_name)
-                    if side:
-                        parsed_sides[side] = odds
-
-                # Only add market if we have at least 2 sides
-                if len(parsed_sides) >= 2:
-                    odds_data[market_key] = parsed_sides
-
         except Exception as e:
-            print(f"Betway parse error: {e}")
-
+            print(f"Betway get_odds error for event {event_id}: {e}")
+        
         return odds_data
-
-    def _map_side(self, outcome_name: str) -> str | None:
-        """Map Betway outcome names to canonical sides."""
-        name = outcome_name.lower().strip()
-        
-        # Totals
-        if "over" in name or name in ("o",):
-            return "over"
-        if "under" in name or name in ("u",):
-            return "under"
-        
-        # Winners
-        if any(x in name for x in ("home", "1", "yes")):
-            return "home"
-        if any(x in name for x in ("away", "2", "no")):
-            return "away"
-        if "draw" in name or name in ("x",):
-            return "draw"
-        
-        return None
 
 
 # ─── Scraper factory ──────────────────────────────────────────────────────
