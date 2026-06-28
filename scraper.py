@@ -253,13 +253,21 @@ class BetwayScraper:
                 "cultureCode": "en-US",
                 "isEsport": False,
                 "boostedOnly": False,
-                "marketTypes": "[\"Win/Draw/Win\"]",
+                "marketTypes": "[Win/Draw/Win]",
             }
             async with httpx.AsyncClient(headers=self.HEADERS, timeout=10) as client:
                 r = await client.get(self.DISCOVERY_BASE, params=params)
                 r.raise_for_status()
                 data = r.json()
-                events = data.get("events", [])
+                for e in data.get("events", []):
+                    events.append({
+                        "eventId": e.get("eventId"),
+                        "name": e.get("name", ""),
+                        "homeTeam": e.get("homeTeam", ""),
+                        "awayTeam": e.get("awayTeam", ""),
+                        "expectedStartEpoch": e.get("expectedStartEpoch", 0),
+                        "sport": sport_id,
+                    })
         except Exception as e:
             print(f"Betway discovery error: {e}")
         return events
